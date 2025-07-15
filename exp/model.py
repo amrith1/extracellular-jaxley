@@ -177,6 +177,7 @@ def compute_eap(params: Dict[str, jnp.ndarray], cell):
     # Compute 1/(4*pi*r) for each electrode-compartment pair (line source approximation for extracellular potential)
     current_to_eap_matrix = EXTRACELLULAR_CONDUCTIVITY / (4 * jnp.pi * elec_compartment_distances_cm)  # shape: (n_electrodes, n_compartments)
     return current_to_eap_matrix @ total_membrane_current # shape: (n_electrodes, n_timepoints)
+
 def transform_point(x: jnp.ndarray, y: jnp.ndarray, z: jnp.ndarray, 
                     phi: jnp.ndarray, theta: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
@@ -263,7 +264,7 @@ class SimpleCellEIAndLoss:
         cell.set("capacitance", MEM_CAPACITANCE)
 
         for param_name in cell_params_list:
-            cell.comp("all").make_trainable(param_name)
+            cell.make_trainable(param_name)
 
         return cell
 

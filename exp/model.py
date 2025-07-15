@@ -263,7 +263,7 @@ class SimpleCellEIAndLoss:
         cell.set("capacitance", MEM_CAPACITANCE)
 
         for param_name in cell_params_list:
-            cell.make_trainable(param_name)
+            cell.comp("all").make_trainable(param_name)
 
         return cell
 

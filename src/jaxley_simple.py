@@ -18,6 +18,13 @@ SIM_TIME_SAMPLES = 500
 TIME_STEP = 2e-3 #ms
 TOTAL_SIM_TIME = SIM_TIME_SAMPLES * TIME_STEP #ms
 
+cell_params_list = [
+    'radius', 'HH_gNa', 'HH_gK', 'axial_resistivity'
+]
+orientation_params_list = [
+    'axon_origin_dist', 'axon_theta', 
+    'axon_phi', 'axon_spin_angle',  
+]
 
 TOTAL_LENGTH = 1500.0
 SEGMENT_LENGTH = 1.0
@@ -149,12 +156,10 @@ def compute_compartment_locations_from_orientations(
     """
     Compute cell compartment locations from orientation parameters.
     """
-    orientation_param_names = [list(o_p.keys())[0] for o_p in orientation_params]
-
-    axon_spin_angle = orientation_params[orientation_param_names.index('axon_spin_angle')]['axon_spin_angle']
-    axon_origin_dist = orientation_params[orientation_param_names.index('axon_origin_dist')]['axon_origin_dist']
-    phi = orientation_params[orientation_param_names.index('axon_phi')]['axon_phi']
-    theta = orientation_params[orientation_param_names.index('axon_theta')]['axon_theta']
+    axon_spin_angle = params['axon_spin_angle']
+    axon_origin_dist = params['axon_origin_dist']
+    phi = params['axon_phi']
+    theta = params['axon_theta']
     
     # Calculate original endpoints before phi and theta rotations using the spin angle
     original_first_x = -1 * TOTAL_LENGTH / 2 * jnp.cos(axon_spin_angle)
@@ -189,16 +194,15 @@ def build_cell():
     cell.set("axial_resistivity", 125.0)
     cell.set("radius", 3.0)
     cell.set("capacitance", MEM_CAPACITANCE)
-    cell.make_trainable("radius")
-    cell.make_trainable("HH_gNa")
-    cell.make_trainable("HH_gK")
-    cell.make_trainable("axial_resistivity")
+
+    for param_name in cell_params_list:
+        cell.make_trainable(param_name)
+
     return cell
 
 cell = build_cell()
-MEM_CAPACITANCE = cell.nodes["capacitance"][0] #uF/cm^2
 
-def compute_membrane_current_density(cell_params: Dict[str, jnp.ndarray]):
+def compute_membrane_current_density(params: Dict[str, jnp.ndarray]):
     """Compute membrane currents using cell parameters."""
     current = jx.step_current(i_delay=1.0, i_dur=1.0, i_amp=0.0, delta_t=TIME_STEP, t_max=TOTAL_SIM_TIME)
     cell.branch(0).loc(0.0).stimulate(current)
@@ -206,6 +210,7 @@ def compute_membrane_current_density(cell_params: Dict[str, jnp.ndarray]):
     for record_value in record_values:
         cell.record(record_value)
 
+    cell_params = [{param_name: params[param_name]} for param_name in cell_params_list]
     outputs = jx.integrate(cell, delta_t=TIME_STEP, params=cell_params).reshape(
         len(record_values), NUM_COMPARTMENTS, -1)
     
@@ -214,18 +219,15 @@ def compute_membrane_current_density(cell_params: Dict[str, jnp.ndarray]):
     capacitive_current = MEM_CAPACITANCE * jnp.diff(membrane_voltage, axis=1) / (TIME_STEP * 1e3) #convert to mA/cm^2
     return capacitive_current + hh_current[:, 1:] #mA/cm^2, total current
 
-def compute_eap(cell_params: Dict[str, jnp.ndarray], orientation_params: Dict[str, jnp.ndarray]):
+def compute_eap(params: Dict[str, jnp.ndarray]):
     """Compute extracellular action potentials."""
-    membrane_current = compute_membrane_current_density(cell_params) #mA/cm^2
+    membrane_current = compute_membrane_current_density(params) #mA/cm^2 (num_compartments, num_timepoints)
 
-    cell_param_names = [list(c_p.keys())[0] for c_p in cell_params]
-
-    compartment_surface_area = 2 * jnp.pi * cell_params[cell_param_names.index("radius")]["radius"] * jnp.array(cell.nodes["length"]) #um^2
+    compartment_surface_area = 2 * jnp.pi * params["radius"] * jnp.array(cell.nodes["length"]) #um^2
     compartment_surface_area = jax.device_put(compartment_surface_area)
-    total_membrane_current = membrane_current * compartment_surface_area[:, None] * 1e-8 # convert to mA
+    total_membrane_current = membrane_current * compartment_surface_area[:, None] * 1e-8 # convert to mA, still (num_compartments, num_timepoints)
 
-    compartment_locations = compute_compartment_locations_from_orientations(orientation_params)
-    print('compartment_locations.shape', compartment_locations.shape)
+    compartment_locations = compute_compartment_locations_from_orientations(params)
 
     #Calculate pairwise distances between electrodes and compartments
     elec_expanded = ELEC_COORDS[:, None, :] # shape: (n_electrodes, 1, 3)
@@ -238,14 +240,6 @@ def compute_eap(cell_params: Dict[str, jnp.ndarray], orientation_params: Dict[st
     return current_to_eap_matrix @ total_membrane_current # shape: (n_electrodes, n_timepoints)
 
 
-cell_params_list = [
-    'radius', 'HH_gNa', 'HH_gK', 'axial_resistivity'
-]
-orientation_params_list = [
-    'axon_origin_dist', 'axon_theta', 
-    'axon_phi', 'axon_spin_angle',  
-]
-
 PARAM_BOUNDS = {
     'axon_origin_dist': (10.0, 30.0),
     'axon_theta': (-jnp.pi/2, jnp.pi/2),
@@ -257,16 +251,6 @@ PARAM_BOUNDS = {
     'axial_resistivity': (50.0, 200.0)
 }
 
-cell_params = cell.get_parameters()
-
-
-
-#jaxley specific parameter transforms
-cell_params_transform = jx.ParamTransform(
-    [{c_p: jt.SigmoidTransform(PARAM_BOUNDS[c_p][0], PARAM_BOUNDS[c_p][1])} for c_p in cell_params_list],
-)
-opt_cell_params = cell_params_transform.inverse(cell_params)
-
 
 def inverse_sigmoid(x: jnp.ndarray, lower: jnp.ndarray, upper: jnp.ndarray) -> jnp.ndarray:
     normalized = (x - lower) / (upper - lower)
@@ -276,55 +260,35 @@ def sigmoid(x: jnp.ndarray, lower: jnp.ndarray, upper: jnp.ndarray) -> jnp.ndarr
     normalized = 1.0 / (1.0 + jnp.exp(-x))
     return lower + (upper - lower) * normalized
 
-def inverse_sigmoid_transform_parameters(params: List[Dict[str, jnp.ndarray]]) -> List[Dict[str, jnp.ndarray]]:
-    transformed_params = []
-    for param_entry in params:
-        param_name = list(param_entry.keys())[0]
-        param_value = param_entry[param_name]
-        transformed_param_value = inverse_sigmoid(param_value, PARAM_BOUNDS[param_name][0], PARAM_BOUNDS[param_name][1])
-        transformed_params.append({param_name: transformed_param_value})
-    return transformed_params
+def inverse_sigmoid_transform_parameters(params: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
+    return {param_name: inverse_sigmoid(param_value, PARAM_BOUNDS[param_name][0], PARAM_BOUNDS[param_name][1])
+            for param_name, param_value in params.items()}
 
-def sigmoid_transform_parameters(params: List[Dict[str, jnp.ndarray]]) -> List[Dict[str, jnp.ndarray]]:
-    transformed_params = []
-    for param_entry in params:
-        param_name = list(param_entry.keys())[0]
-        param_value = param_entry[param_name]
-        transformed_param_value = sigmoid(param_value, PARAM_BOUNDS[param_name][0], PARAM_BOUNDS[param_name][1])
-        transformed_params.append({param_name: transformed_param_value})
-    return transformed_params
-
-orientation_params = [
-    {'axon_origin_dist': jnp.array([20.0])}, 
-    {'axon_theta': jnp.array([0.0])}, 
-    {'axon_phi': jnp.array([jnp.pi/2])}, 
-    {'axon_spin_angle': jnp.array([0.0])}
-]
+def sigmoid_transform_parameters(params: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
+    return {param_name: sigmoid(param_value, PARAM_BOUNDS[param_name][0], PARAM_BOUNDS[param_name][1])
+            for param_name, param_value in params.items()}
 
 def loss_function(opt_params):
-    # Split optimization parameters into cell and orientation params
-    opt_cell_params = opt_params[0:4]
-    opt_orientation_params = opt_params[4:]
+    params = sigmoid_transform_parameters(opt_params)
+    return jnp.sum(compute_eap(params)**2)
 
-    cell_params = cell_params_transform.forward(opt_cell_params)
-    orientation_params = sigmoid_transform_parameters(opt_orientation_params)
-
-    return jnp.sum(compute_eap(cell_params, orientation_params)**2)
-
-
-print(opt_cell_params, flush=True)
-opt_orientation_params = inverse_sigmoid_transform_parameters(orientation_params)
-
-print(opt_orientation_params)
-
-loss_function(opt_cell_params + opt_orientation_params)
-
-print('Loss function worked')
-
-# JIT compile the loss function and compute gradients
 loss_grad_fn = jax.jit(jax.value_and_grad(loss_function))
 
-outputs = loss_grad_fn(opt_cell_params + opt_orientation_params)
+params = {
+    'radius': jnp.array([3.0]),
+    'HH_gNa': jnp.array([0.2]),
+    'HH_gK': jnp.array([0.2]),
+    'axial_resistivity': jnp.array([125.0]),
+    'axon_origin_dist': jnp.array([20.0]),
+    'axon_theta': jnp.array([0.0]),
+    'axon_phi': jnp.array([jnp.pi/2]),
+    'axon_spin_angle': jnp.array([0.0])
+}
+opt_params = inverse_sigmoid_transform_parameters(params)
+
+
+
+outputs = loss_grad_fn(opt_params)
 
 print('Jitted loss function gradients worked', outputs)
 

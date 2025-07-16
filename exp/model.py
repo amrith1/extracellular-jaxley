@@ -29,6 +29,17 @@ orientation_params_list = [
     'axon_phi', 'axon_spin_angle',  
 ]
 
+MODEL_BOUNDS = {
+        'axon_origin_dist': (10.0, 30.0),
+        'axon_theta': (-jnp.pi/2, jnp.pi/2),
+        'axon_phi': (0.0, jnp.pi),
+        'axon_spin_angle': (-jnp.pi/2, jnp.pi/2),
+        'radius': (1.0, 5.0),
+        'HH_gNa': (0.1, 0.3),
+        'HH_gK': (0.1, 0.3),
+        'axial_resistivity': (50.0, 200.0)
+        }
+
 TOTAL_LENGTH = 1500.0
 SEGMENT_LENGTH = 1.0
 assert TOTAL_LENGTH % SEGMENT_LENGTH == 0, "TOTAL_LENGTH must be divisible by SEGMENT_LENGTH"
@@ -53,6 +64,31 @@ if ELECTRODE_CONFIGURATION == 'triangle':
     ELEC_COORDS = ELEC_SPACING*ELEC_COORDS
     ELEC_COORDS = jnp.array(ELEC_COORDS, dtype=jnp.float32)
     ELEC_COORDS = jax.device_put(ELEC_COORDS) # Move to default accelerator (GPU if available)
+
+#generate a random model within the bounds to produce the physical ei
+ground_truth_model_kwargs = {}
+for param in MODEL_BOUNDS.keys():
+    param_name = param.replace('_bounds', '')
+    if param_name in cell_params_list and param_name in orientation_params_list:
+        mean = (MODEL_BOUNDS[param_name][0] + MODEL_BOUNDS[param_name][1]) / 2.0
+        max_min_range = MODEL_BOUNDS[param_name][1] - MODEL_BOUNDS[param_name][0]
+        CLIP_COEFF = np.abs(PERCENTILE_SAMPLE_AND_CLIP - 0.5)
+        sampled_val = np.random.uniform(mean - CLIP_COEFF * max_min_range, mean + CLIP_COEFF * max_min_range)
+        ground_truth_model_kwargs[param_name] = jnp.array([sampled_val])
+    else:
+        midpoint = (MODEL_BOUNDS[param_name][0] + MODEL_BOUNDS[param_name][1]) / 2.0
+        ground_truth_model_kwargs[param_name] = jnp.array([midpoint])
+
+ground_truth_model_kwargs['total_length_um'] = jnp.array([TOTAL_LENGTH])
+ground_truth_model_kwargs['segment_length_um'] = jnp.array([SEGMENT_LENGTH])
+
+ground_truth_model_kwargs = {**MODEL_BOUNDS, **ground_truth_model_kwargs}
+print(f"Ground truth model kwargs: {ground_truth_model_kwargs}")
+
+ground_truth = SimpleCellEIAndLoss()
+ground_truth_ei = ground_truth.predict(dict(ground_truth_model_kwargs))
+
+print(f"Ground truth EI shape: {ground_truth_ei.shape}")
 
 def _vtrap(x, y):
     return x / (save_exp(x / y) - 1.0)
@@ -403,6 +439,14 @@ class SimpleCellEIAndLoss:
         return {param_name: self.sigmoid(param_value, self.PARAM_BOUNDS[param_name][0], self.PARAM_BOUNDS[param_name][1])
                 for param_name, param_value in params.items()}
 
+    def get_cell(self):
+        """
+        Returns the cell object.
+        """
+        return self.cell
+    
+   
+
     # def loss_function(opt_params):
     #     params = sigmoid_transform_parameters(opt_params)
     #     return jnp.sum(compute_eap(params)**2)
@@ -416,7 +460,9 @@ class SimpleCellEIAndLoss:
         outputs = compute_eap(params, self.cell)
 
         return outputs
+    def loss_fn(self, predicted_ei, true_ei):
 
+        pass
     def loss(self, original_params, true_ei):
         """
         Computes a loss that is robust to temporal shifts by using a
@@ -424,6 +470,8 @@ class SimpleCellEIAndLoss:
         """
         opt_params = self.sigmoid_transform_parameters(original_params)
         predicted_ei = self.predict(opt_params)
+
+        loss = self.loss_fn(predicted_ei, true_ei)
 
         # true_len = true_ei.shape[0]
         # pred_len = predicted_ei.shape[0]
@@ -456,11 +504,11 @@ class SimpleCellEIAndLoss:
 
         return final_loss
 
-    def train(self, data_point, num_epochs=NUM_EPOCHS, learning_rate=0.01):
+    def train(self, num_epochs=NUM_EPOCHS, learning_rate=0.01):
         """
         Simplified training without Jaxley's ParamTransform.
         """
-        self.data_point = data_point
+        self.data_point = ground_truth_ei
         
         # Combine all parameters into one dictionary
         current_params = dict(self.params)
@@ -476,7 +524,7 @@ class SimpleCellEIAndLoss:
         
         for epoch in range(num_epochs):
             # Compute loss and gradients
-            loss_val, gradients = self.jitted_grad(opt_params, data_point)
+            loss_val, gradients = self.jitted_grad(opt_params, self.data_point)
             print(gradients)
             
             # Check for NaN

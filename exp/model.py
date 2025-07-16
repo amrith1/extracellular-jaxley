@@ -1,7 +1,7 @@
 from typing import Dict, Optional, Tuple, List
 import jax
 
-jax.config.update('jax_platform_name', 'cpu')  # Force GPU usage
+jax.config.update('jax_platform_name', 'gpu')  # Force GPU usage
 jax.config.update('jax_enable_x64', True)
 
 import jax.numpy as jnp
@@ -44,6 +44,7 @@ ELECTRODE_CONFIGURATION = 'triangle'
 EXTRACELLULAR_CONDUCTIVITY = 1000 #ohm-cm
 MEM_CAPACITANCE = 1.0 #uF/cm^2
 ELEC_COORDS = None
+DISK_ELEC_RADIUS = 5.0 #um, not used here since point electrode simulation
 
 if ELECTRODE_CONFIGURATION == 'triangle':
     #place electrodes at equilateral traiangle in x=0 plane, center at (0,0,0), spaced ELEC_SPACING apart
@@ -217,9 +218,120 @@ def compute_compartment_locations_from_orientations(
         jnp.linspace(ff_z, fl_z, NUM_COMPARTMENTS, endpoint=False)
     ], axis=1).reshape(-1, 3)
 
+def disk_elec_stim_potential_mV_per_uA(elec_radius_um: jnp.ndarray, extra_resistivity_ohm_cm: jnp.ndarray, 
+                                       electrode_locations_um: jnp.ndarray, point_locations_um: jnp.ndarray) -> jnp.ndarray:
+    """
+    Compute disk electrode potential using analytical solution.
+    """
+    assert elec_radius_um.size == 1 and extra_resistivity_ohm_cm.size == 1,\
+        "elec_radius_um and extra_resistivity_ohm_cm must be scalars"
+
+    # Assert all electrode z-coordinates are 0
+    assert jnp.allclose(electrode_locations_um[:, 2], 0.0), "All electrode z-coordinates must be 0"
+    assert jnp.all(point_locations_um[:, 2] < 0.0), "All point locations must be below the z=0 plane"
+    
+    # z offset (distance below z=0 plane)
+    z_off = -1 * point_locations_um[:, 2:3]  # shape: (n_points, 1)
+    # radial distance in xy plane
+    elec_xy = electrode_locations_um[:, :2]  # shape: (n_electrodes, 2)
+    point_xy = point_locations_um[:, :2]     # shape: (n_points, 2)
+    
+    # Compute pairwise distances in xy plane
+    r_off = jnp.sqrt(jnp.sum((elec_xy[:, None, :] - point_xy[None, :, :])**2, axis=2))  # shape: (n_electrodes, n_points)
+    
+    # Constant multiplier
+    constant_multiplier = 1e1 * extra_resistivity_ohm_cm / (2 * jnp.pi * elec_radius_um)  # kohm
+    
+    # Distances from outer and inner edges of disk
+    from_outer_dist = jnp.sqrt((r_off - elec_radius_um)**2 + z_off.T**2)  # shape: (n_electrodes, n_points)
+    from_inner_dist = jnp.sqrt((r_off + elec_radius_um)**2 + z_off.T**2)  # shape: (n_electrodes, n_points)
+    
+    # Transfer impedance using analytical solution
+    transfer_impedance = jnp.arcsin(
+        2 * elec_radius_um / (from_outer_dist + from_inner_dist)
+    )
+    return constant_multiplier * transfer_impedance  # shape: (n_electrodes, n_points)
+
+def point_source_stim_potential_mV_per_uA(extra_resistivity_ohm_cm: jnp.ndarray, 
+                                       electrode_locations_um: jnp.ndarray, point_locations_um: jnp.ndarray) -> jnp.ndarray:
+    """
+    Compute point source potential using analytical solution.
+    """
+    assert extra_resistivity_ohm_cm.size == 1,\
+        "elec_radius_um and extra_resistivity_ohm_cm must be scalars"
+    
+    elec_point_distances_cm = jnp.linalg.norm(electrode_locations_um[:, None, :] - point_locations_um[None, :, :], axis=2) * 1e-4 # convert to cm
+    return extra_resistivity_ohm_cm / (4 * jnp.pi * elec_point_distances_cm) # shape: (n_electrodes, n_points)
+
+def extracellular_triphasic_150us_stim_multielec(cell, adjacency_matrix: jnp.ndarray, params: Dict[str, jnp.ndarray], electrode_locations_um: jnp.ndarray, \
+    electrode_intensities_uA: jnp.ndarray, compartment_locations_um: jnp.ndarray, extra_resistivity_ohm_cm: jnp.ndarray, time_step: float, t_pre: float,t_max: float ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Compute extracellular triphasic stimulus potential using analytical solution.
+    """
+    # Get number of electrodes and compartments
+    n_electrodes = electrode_locations_um.shape[0]
+    n_compartments = compartment_locations_um.shape[0]
+
+    extracellular_potential_mV_per_elec = point_source_stim_potential_mV_per_uA(
+        extra_resistivity_ohm_cm=extra_resistivity_ohm_cm, 
+        electrode_locations_um=electrode_locations_um, 
+        point_locations_um=compartment_locations_um
+        ) #shape: (n_electrodes, n_compartments)
+    
+    extracellular_potential_mV = electrode_intensities_uA @ extracellular_potential_mV_per_elec
+    assert extracellular_potential_mV.shape == (n_compartments,), "extracellular potential shape mismatch"
+
+    axial_resistance_compartments = params['axial_resistivity'] * (jnp.array(cell.nodes["length"]) / (jnp.pi * params['radius']**2)) * 1e-2 # Mohm
+
+    # Compute current flowing into each compartment per uA
+    # For each connected pair, compute voltage difference and resulting current
+    currents_compartments = jnp.zeros(n_compartments)
+    connected_indices = jnp.nonzero(adjacency_matrix)
+    # Assert adjacency matrix is symmetric
+    assert jnp.allclose(adjacency_matrix, adjacency_matrix.T), "Adjacency matrix must be symmetric"
+    
+    # Assert diagonal is zero 
+    assert jnp.allclose(jnp.diag(adjacency_matrix), 0), "Diagonal of adjacency matrix must be zero"
+
+    for i, j in zip(*connected_indices):
+        # Get voltage difference between compartments i and j
+        v_diff = extracellular_potential_mV[j] - extracellular_potential_mV[i] #current flowing into i 
+        # Compute axial resistance between compartments
+        r_axial = (axial_resistance_compartments[i] + axial_resistance_compartments[j]) / 2
+        # Add current contribution
+        currents_compartments = currents_compartments.at[i].add(v_diff / r_axial)  # current (nA) flowing i
+
+    assert 50e-3 % time_step == 0, "50us is not a multiple of time_step"
+    assert t_pre % time_step == 0, "t_pre is not a multiple of time_step"
+    assert t_max % time_step == 0, "t_max is not a multiple of time_step"
+
+    # Loop through time points to set current time series values
+    for t_idx in range(int(t_max / time_step)):
+        if t_idx >= int(t_pre / time_step) and t_idx < int((t_pre + 50e-3) / time_step):
+            current_time_series = current_time_series.at[:, t_idx].set(currents_compartments * (2/3))
+        elif t_idx >= int((t_pre + 50e-3) / time_step) and t_idx < int((t_pre + 100e-3) / time_step):
+            current_time_series = current_time_series.at[:, t_idx].set(currents_compartments * (-1))
+        elif t_idx >= int((t_pre + 100e-3) / time_step) and t_idx < int((t_pre + 150e-3) / time_step):
+            current_time_series = current_time_series.at[:, t_idx].set(currents_compartments * (1/3))
+
+    cell.stimulate(current_time_series)
+    record_values = ["v", "HH_m", "HH_h", "HH_n"]
+    for record_value in record_values:
+        cell.record(record_value)
+    
+    cell_params = [{param_name: params[param_name]} for param_name in cell_params_list]
+    outputs = jx.integrate(cell, delta_t=TIME_STEP, params=cell_params_list).reshape(
+        len(record_values), NUM_COMPARTMENTS, -1)
+    
+    v, m, h, n = outputs[0, :, :], outputs[1, :, :], outputs[2, :, :], outputs[3, :, :]
+    return v, m, h, n
+    
+
+
+
 class SimpleCellEIAndLoss:
     def __init__(self):
-        self.cell = self.build_cell()
+        self.cell, self.adjacency_matrix = self.build_cell()
         self.cell.set("length", SEGMENT_LENGTH)
         self.cell.set("capacitance", MEM_CAPACITANCE)
         self.cell.set("axial_resistivity", 125.0)
@@ -266,7 +378,13 @@ class SimpleCellEIAndLoss:
         for param_name in cell_params_list:
             cell.make_trainable(param_name)
 
-        return cell
+        adjacency_matrix = jnp.zeros((NUM_COMPARTMENTS, NUM_COMPARTMENTS))
+        # Set adjacent compartments to 1 in adjacency matrix
+        for i in range(NUM_COMPARTMENTS-1):
+            adjacency_matrix = adjacency_matrix.at[i,i+1].set(1)
+            adjacency_matrix = adjacency_matrix.at[i+1,i].set(1)
+
+        return cell, adjacency_matrix
 
 
     def inverse_sigmoid(self, x: jnp.ndarray, lower: jnp.ndarray, upper: jnp.ndarray) -> jnp.ndarray:

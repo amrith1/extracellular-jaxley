@@ -1,18 +1,17 @@
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Tuple, List
 import jax
 
-jax.config.update('jax_platform_name', 'gpu')  # Force GPU usage
+jax.config.update('jax_platform_name', 'cpu')  # Force GPU usage
 jax.config.update('jax_enable_x64', True)
 
 import jax.numpy as jnp
 import numpy as np
 import jaxley as jx
-from jaxley.solver_gate import solve_gate_exponential, save_exp
-from jaxley.channels import Channel
-import jaxley.optimize.transforms as jt
 import optax
 import jax.lax as lax
 from jax import jit, vmap, value_and_grad
+
+from lib import HH
 
 
 SEED = 0
@@ -29,7 +28,9 @@ orientation_params_list = [
     'axon_phi', 'axon_spin_angle',  
 ]
 
-MODEL_BOUNDS = {
+all_params_list = cell_params_list + orientation_params_list
+
+PARAMETER_BOUNDS = {
         'axon_origin_dist': (10.0, 30.0),
         'axon_theta': (-jnp.pi/2, jnp.pi/2),
         'axon_phi': (0.0, jnp.pi),
@@ -65,118 +66,8 @@ if ELECTRODE_CONFIGURATION == 'triangle':
     ELEC_COORDS = jnp.array(ELEC_COORDS, dtype=jnp.float32)
     ELEC_COORDS = jax.device_put(ELEC_COORDS) # Move to default accelerator (GPU if available)
 
-#generate a random model within the bounds to produce the physical ei
-ground_truth_model_kwargs = {}
-for param in MODEL_BOUNDS.keys():
-    param_name = param.replace('_bounds', '')
-    if param_name in cell_params_list and param_name in orientation_params_list:
-        mean = (MODEL_BOUNDS[param_name][0] + MODEL_BOUNDS[param_name][1]) / 2.0
-        max_min_range = MODEL_BOUNDS[param_name][1] - MODEL_BOUNDS[param_name][0]
-        CLIP_COEFF = np.abs(PERCENTILE_SAMPLE_AND_CLIP - 0.5)
-        sampled_val = np.random.uniform(mean - CLIP_COEFF * max_min_range, mean + CLIP_COEFF * max_min_range)
-        ground_truth_model_kwargs[param_name] = jnp.array([sampled_val])
-    else:
-        midpoint = (MODEL_BOUNDS[param_name][0] + MODEL_BOUNDS[param_name][1]) / 2.0
-        ground_truth_model_kwargs[param_name] = jnp.array([midpoint])
 
-ground_truth_model_kwargs['total_length_um'] = jnp.array([TOTAL_LENGTH])
-ground_truth_model_kwargs['segment_length_um'] = jnp.array([SEGMENT_LENGTH])
 
-ground_truth_model_kwargs = {**MODEL_BOUNDS, **ground_truth_model_kwargs}
-print(f"Ground truth model kwargs: {ground_truth_model_kwargs}")
-
-ground_truth = SimpleCellEIAndLoss()
-ground_truth_ei = ground_truth.predict(dict(ground_truth_model_kwargs))
-
-print(f"Ground truth EI shape: {ground_truth_ei.shape}")
-
-def _vtrap(x, y):
-    return x / (save_exp(x / y) - 1.0)
-
-class HH(Channel):
-    """Hodgkin-Huxley channel."""
-
-    def __init__(self, name: Optional[str] = None):
-        self.current_is_in_mA_per_cm2 = True
-
-        super().__init__(name)
-        prefix = self._name
-        self.channel_params = {
-            f"{prefix}_gNa": 0.12,
-            f"{prefix}_gK": 0.036,
-            f"{prefix}_gLeak": 0.0003,
-            f"{prefix}_eNa": 60.0,
-            f"{prefix}_eK": -77.0,
-            f"{prefix}_eLeak": -54.3,
-        }
-        self.channel_states = {
-            f"{prefix}_m": 0.2,
-            f"{prefix}_h": 0.2,
-            f"{prefix}_n": 0.2,
-        }
-        self.current_name = f"i_HH"
-
-    def update_states(
-        self,
-        states: Dict[str, jnp.ndarray],
-        dt,
-        v,
-        params: Dict[str, jnp.ndarray],
-    ):
-        """Return updated HH channel state."""
-        prefix = self._name
-        m, h, n = states[f"{prefix}_m"], states[f"{prefix}_h"], states[f"{prefix}_n"]
-        new_m = solve_gate_exponential(m, dt, *self.m_gate(v))
-        new_h = solve_gate_exponential(h, dt, *self.h_gate(v))
-        new_n = solve_gate_exponential(n, dt, *self.n_gate(v))
-        return {f"{prefix}_m": new_m, f"{prefix}_h": new_h, f"{prefix}_n": new_n}
-
-    def compute_current(
-        self, states: Dict[str, jnp.ndarray], v, params: Dict[str, jnp.ndarray]
-    ):
-        """Return current through HH channels."""
-        prefix = self._name
-        m, h, n = states[f"{prefix}_m"], states[f"{prefix}_h"], states[f"{prefix}_n"]
-
-        gNa = params[f"{prefix}_gNa"] * (m**3) * h  # S/cm^2
-        gK = params[f"{prefix}_gK"] * n**4  # S/cm^2
-        gLeak = params[f"{prefix}_gLeak"]  # S/cm^2
-
-        return (
-            gNa * (v - params[f"{prefix}_eNa"])
-            + gK * (v - params[f"{prefix}_eK"])
-            + gLeak * (v - params[f"{prefix}_eLeak"])
-        )
-
-    def init_state(self, states, v, params, delta_t):
-        """Initialize the state such at fixed point of gate dynamics."""
-        prefix = self._name
-        alpha_m, beta_m = self.m_gate(v)
-        alpha_h, beta_h = self.h_gate(v)
-        alpha_n, beta_n = self.n_gate(v)
-        return {
-            f"{prefix}_m": alpha_m / (alpha_m + beta_m),
-            f"{prefix}_h": alpha_h / (alpha_h + beta_h),
-            f"{prefix}_n": alpha_n / (alpha_n + beta_n),
-        }
-
-    @staticmethod
-    def m_gate(v):
-        alpha = 2.725 * _vtrap(-(v + 35), 10)
-        beta = 90.83 * save_exp(-(v + 60) / 20)
-        return alpha, beta
-
-    @staticmethod
-    def h_gate(v):
-        alpha = 1.817 * save_exp(-(v + 52) / 20)
-        beta = 27.25 / (save_exp(-(v + 22) / 10) + 1)
-        return alpha, beta
-
-    @staticmethod
-    def n_gate(v):
-        alpha = 0.09575 * _vtrap(-(v + 37), 10)
-        beta = 1.915 * save_exp(-(v + 47) / 80)
-        return alpha, beta
 
 def compute_membrane_current_density(cell,params: Dict[str, jnp.ndarray]):
     """Compute membrane currents using cell parameters."""
@@ -194,6 +85,7 @@ def compute_membrane_current_density(cell,params: Dict[str, jnp.ndarray]):
     membrane_voltage, hh_current = outputs[0, :, :], outputs[1, :, :]
     capacitive_current = MEM_CAPACITANCE * jnp.diff(membrane_voltage, axis=1) / (TIME_STEP * 1e3) #convert to mA/cm^2
     return capacitive_current + hh_current[:, 1:] #mA/cm^2, total current
+
 
 def compute_eap(params: Dict[str, jnp.ndarray], cell):
     """Compute extracellular action potentials."""
@@ -365,33 +257,18 @@ def extracellular_triphasic_150us_stim_multielec(cell, adjacency_matrix: jnp.nda
 
 
 
-class SimpleCellEIAndLoss:
+class StraightAxon:
     def __init__(self):
+        self.params = {}
+        for param_name in all_params_list:
+            bounds = PARAMETER_BOUNDS[param_name]
+            self.params[param_name] = jnp.array([(bounds[0] + bounds[1])/2])
+
         self.cell, self.adjacency_matrix = self.build_cell()
-        self.cell.set("length", SEGMENT_LENGTH)
-        self.cell.set("capacitance", MEM_CAPACITANCE)
-        self.cell.set("axial_resistivity", 125.0)
-        self.params = {
-        'radius': jnp.array([3.0]),
-        'HH_gNa': jnp.array([0.2]),
-        'HH_gK': jnp.array([0.2]),
-        'axial_resistivity': jnp.array([125.0]),
-        'axon_origin_dist': jnp.array([20.0]),
-        'axon_theta': jnp.array([0.0]),
-        'axon_phi': jnp.array([jnp.pi/2]),
-        'axon_spin_angle': jnp.array([0.0])
-        }
-        self.PARAM_BOUNDS = {
-        'axon_origin_dist': (10.0, 30.0),
-        'axon_theta': (-jnp.pi/2, jnp.pi/2),
-        'axon_phi': (0.0, jnp.pi),
-        'axon_spin_angle': (-jnp.pi/2, jnp.pi/2),
-        'radius': (1.0, 5.0),
-        'HH_gNa': (0.1, 0.3),
-        'HH_gK': (0.1, 0.3),
-        'axial_resistivity': (50.0, 200.0)
-        }
+
+        self.PARAM_BOUNDS = PARAMETER_BOUNDS
         self.jitted_grad = jit(value_and_grad(self.loss, argnums=0))
+        self.jitted_predict_ei = jit(self.predict_ei)
 
     def build_cell(self):
         """Build a cell with the given parameters."""
@@ -409,6 +286,8 @@ class SimpleCellEIAndLoss:
         cell.set("HH_gK", 0.2)
         cell.set("axial_resistivity", 125.0)
         cell.set("radius", 3.0)
+        cell.set("capacitance", MEM_CAPACITANCE)
+        cell.set("length", SEGMENT_LENGTH)
         cell.set("capacitance", MEM_CAPACITANCE)
 
         for param_name in cell_params_list:
@@ -439,37 +318,22 @@ class SimpleCellEIAndLoss:
         return {param_name: self.sigmoid(param_value, self.PARAM_BOUNDS[param_name][0], self.PARAM_BOUNDS[param_name][1])
                 for param_name, param_value in params.items()}
 
-    def get_cell(self):
-        """
-        Returns the cell object.
-        """
-        return self.cell
-    
-   
-
-    # def loss_function(opt_params):
-    #     params = sigmoid_transform_parameters(opt_params)
-    #     return jnp.sum(compute_eap(params)**2)
-
-    # loss_grad_fn = jax.jit(jax.value_and_grad(loss_function))
-
-    def predict(self, params):
+    def predict_ei(self, params):
         """
         Predict extracellular potentials using the current parameters.
         """
-        outputs = compute_eap(params, self.cell)
-
-        return outputs
+        return compute_eap(params, self.cell)
+    
     def loss_fn(self, predicted_ei, true_ei):
+        return jnp.sum(predicted_ei**2)
 
-        pass
     def loss(self, original_params, true_ei):
         """
         Computes a loss that is robust to temporal shifts by using a
         differentiable soft-alignment mechanism.
         """
         opt_params = self.sigmoid_transform_parameters(original_params)
-        predicted_ei = self.predict(opt_params)
+        predicted_ei = self.predict_ei(opt_params)
 
         loss = self.loss_fn(predicted_ei, true_ei)
 
@@ -508,7 +372,7 @@ class SimpleCellEIAndLoss:
         """
         Simplified training without Jaxley's ParamTransform.
         """
-        self.data_point = ground_truth_ei
+        self.data_point = None
         
         # Combine all parameters into one dictionary
         current_params = dict(self.params)
@@ -550,9 +414,26 @@ class SimpleCellEIAndLoss:
         
         return final_params, epoch_losses
 
+def generate_random_gt_params_ei(seed=None):
+    PERCENTILE_SAMPLE_AND_CLIP = 0.85
+    if seed is not None:
+        np.random.seed(seed)
+    #generate a random model within the bounds to produce the physical ei
+    ground_truth_model_params = {}
+    for param in PARAMETER_BOUNDS.keys():
+        mean = (PARAMETER_BOUNDS[param][0] + PARAMETER_BOUNDS[param][1]) / 2.0
+        max_min_range = PARAMETER_BOUNDS[param][1] - PARAMETER_BOUNDS[param][0]
+        CLIP_COEFF = np.abs(PERCENTILE_SAMPLE_AND_CLIP - 0.5)
+        sampled_val = np.random.uniform(mean - CLIP_COEFF * max_min_range, mean + CLIP_COEFF * max_min_range)
+        ground_truth_model_params[param] = jnp.array([sampled_val])
 
+    ground_truth_model_params['total_length_um'] = jnp.array([TOTAL_LENGTH])
+    ground_truth_model_params['segment_length_um'] = jnp.array([SEGMENT_LENGTH])
+    ground_truth_model_params = {**PARAMETER_BOUNDS, **ground_truth_model_params}
 
-
-
+    cell_container = StraightAxon()
+    gt_ei = cell_container.predict_ei(ground_truth_model_params)
+    
+    return ground_truth_model_params, gt_ei
 
         

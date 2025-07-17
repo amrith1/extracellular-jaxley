@@ -66,9 +66,6 @@ if ELECTRODE_CONFIGURATION == 'triangle':
     ELEC_COORDS = jnp.array(ELEC_COORDS, dtype=jnp.float32)
     ELEC_COORDS = jax.device_put(ELEC_COORDS) # Move to default accelerator (GPU if available)
 
-
-
-
 def compute_membrane_current_density(cell,params: Dict[str, jnp.ndarray]):
     """Compute membrane currents using cell parameters."""
     current = jx.step_current(i_delay=1.0, i_dur=1.0, i_amp=0.0, delta_t=TIME_STEP, t_max=TOTAL_SIM_TIME)

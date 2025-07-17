@@ -3,6 +3,7 @@ from jaxley.solver_gate import solve_gate_exponential, save_exp
 from jaxley.channels import Channel
 from typing import Optional, Dict
 
+
 def _vtrap(x, y):
     return x / (save_exp(x / y) - 1.0)
 

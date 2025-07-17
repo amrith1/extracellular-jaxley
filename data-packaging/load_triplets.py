@@ -20,6 +20,7 @@ from gpytorch.means import ConstantMean, LinearMean, ZeroMean
 from gpytorch.kernels import RBFKernel
 from gpytorch.likelihoods import GaussianLikelihood
 import visionloader as vl
+import h5py
 
 
 # In[2]:
@@ -54,29 +55,71 @@ def is_valid_set(numbers, is_30um=True):
     return np.all(chunk_indices % 2 == 0) or np.all(chunk_indices % 2 == 1)    
 
 
-# In[3]:
-
-
+# Constants
 ESTIM_ANALYSIS_BASE = '/Volumes/Lab/Users/praful/outputs/pp_out'
 WNOISE_ANALYSIS_BASE = '/Volumes/Analysis'
+
+# Dummy channels to remove (0-indexed)
+DUMMY_CHANNELS_519 = [0, 1, 130, 259, 260, 389, 390, 519]
+
+# Dataset configurations
 datasets = ['2020-09-29-2', '2020-09-29-2', '2020-09-29-2', '2020-10-06-7', '2020-10-18-0', '2020-10-18-5', '2021-02-13-6', '2021-03-12-0', '2021-03-12-3']
 dataruns = ['data007', 'data008', 'data009', 'data003', 'data003', 'data006', 'data003', 'data002', 'data003']
 wnoises = ['kilosort_data006/data006', 'kilosort_data006/data006', 'kilosort_data006/data006', 'kilosort_data000/data000', 
            'kilosort_data000/data000', 'kilosort_data002/data002', 'kilosort_data001/data001', 'kilosort_data000/data000',
            'kilosort_data000/data000']
 
-selectivities = []
-ms = [8]
-zero_prob = 0.01
-slope_bound = 100
-R2_thresh = 0.025
-reg_param = 0.5
-method = 'L-BFGS-B'
-reg_method = 'l2'
+# Output file for structured data
+output_file = '/Volumes/Lab/Users/seijiy/extracellular-jaxley/data-packaging/triplet_outputs/dense_triplets.h5'
 
-thr_factor = 1
+# Dictionary to store data organized by cells
+cells_data = {}
 
-savepath_base = '/Volumes/Lab/Users/seijiy/outputs'
+def convert_to_dense_vector(stim_elecs, amps_gsort):
+    """
+    Convert sparse stimulation data to dense vector with dummy channels removed.
+    
+    Args:
+        stim_elecs: Array of 3 electrode indices (1-indexed)
+        amps_gsort: Array of 3 current values corresponding to the electrodes
+    
+    Returns:
+        dense_vector: (NUM_ELECTRODES - 8)-dimensional array with zeros everywhere except at stim_elecs positions
+    """
+    dense_vector = np.zeros(NUM_ELECTRODES)
+    
+    # Convert to 0-indexed for array indexing
+    stim_elecs_0indexed = np.array(stim_elecs) - 1
+    
+    # Place the current values at the correct electrode positions
+    for i, (elec_idx, current) in enumerate(zip(stim_elecs_0indexed, amps_gsort)):
+        dense_vector[elec_idx] = current
+    
+    # Remove dummy channels
+    valid_indices = [i for i in range(NUM_ELECTRODES) if i not in DUMMY_CHANNELS_519]
+    dense_vector_clean = dense_vector[valid_indices]
+    
+    return dense_vector_clean
+
+print("Processing datasets to create dense stimulation vectors...")
+
+# Get electrode coordinates from the first dataset to use for all datasets
+first_dataset = datasets[0]
+first_datarun = dataruns[0]
+first_wnoise = wnoises[0]
+vstim_datapath = os.path.join(WNOISE_ANALYSIS_BASE, first_dataset, first_wnoise)
+vstim_datarun = os.path.basename(os.path.normpath(vstim_datapath))
+vcd = vl.load_vision_data(vstim_datapath, vstim_datarun,
+                        include_neurons=True,
+                        include_ei=True,
+                        include_params=True,
+                        include_noise=True)
+coords = vcd.electrode_map
+
+if coords is None:
+    raise ValueError("electrode_map is None - cannot proceed")
+NUM_ELECTRODES = coords.shape[0]
+print(f"Number of electrodes: {NUM_ELECTRODES}")
 
 for dataset, datarun, wnoise in zip(datasets, dataruns, wnoises):
     print(f'Processing {dataset} {datarun} {wnoise}')
@@ -111,6 +154,13 @@ for dataset, datarun, wnoise in zip(datasets, dataruns, wnoises):
                             include_params=True,
                             include_noise=True)
     coords = vcd.electrode_map
+    
+    # Get number of electrodes from the electrode map
+    if coords is None:
+        print(f"Warning: electrode_map is None for dataset {dataset}")
+        continue
+    NUM_ELECTRODES = coords.shape[0]
+    print(f"Number of electrodes: {NUM_ELECTRODES}")
 
     patterns = {}
     for file in file_list:
@@ -129,275 +179,236 @@ for dataset, datarun, wnoise in zip(datasets, dataruns, wnoises):
             if not is_valid_set(stim_elecs):
                 continue
 
-            print(f'Pattern {p}, cell {c}')
-
-            fig, ax = plt.subplots(figsize=(8, 8))
-            ax.scatter(coords[:, 0], coords[:, 1], s=1, c="k")
-            plt.axis('off')
-
-            print(vcd.get_cell_type_for_cell(c))
-            good_inds, EI = mutils.get_collapsed_ei_thr(vcd, c, thr_factor)
-            scat = ax.scatter(coords[good_inds, 0], coords[good_inds, 1], s=np.abs(EI[good_inds]) * 3, alpha=0.8,#)
-                            c='tab:red')
-
-            # Get the coordinates of the stimulation electrodes
-            stim_coords = coords[stim_elecs - 1, :]
-
-            for l, txt in enumerate(stim_elecs):
-                ax.annotate(l+1, (coords[stim_elecs[l]-1, 0], coords[stim_elecs[l]-1, 1]), color='r', fontsize=14)
-
-            # Draw a triangle connecting the stimulation electrodes
-            if stim_coords.shape[0] == 3:  # Ensure we have exactly 3 electrodes
-                triangle = plt.Polygon(stim_coords, edgecolor='k', fill=False, linewidth=1)
-                ax.add_patch(triangle)
+            # Load fitted data for response probabilities
+            fit_data = loadmat(os.path.join(path, file))
+            params = fit_data['params_true']
+            X = fit_data['amps_fit']
+            probs_fit = fit_data['probs_fit'].flatten()
+            
+            # Check if GPR data is available
+            gpr_available = 'gpr_predictions' in fit_data
+            if gpr_available:
+                gpr_predictions = fit_data['gpr_predictions'].flatten()
+                print(f"    GPR data found for cell {c}, pattern {p}")
             else:
-                print(f"Expected 3 stimulation electrodes, but got {stim_coords.shape[0]}.")
-
-            plt.show()
+                print(f"    No GPR data for cell {c}, pattern {p}")
             
-            savepath = os.path.join(savepath_base, f'triplet_{dataset}_p{p}_c{c}.mat')
-            savedict = {}
-            savedict['cell'] = c
-            savedict['ei'] = vcd.get_ei_for_cell(c).ei
-            savedict['stim_elecs'] = stim_elecs
-            savedict['piece'] = dataset
-            savedict['wnoise'] = wnoise
-            savedict['estim_datarun'] = datarun
-            savedict['amps_all'] = deepcopy(amps_gsort)
-
-            params = loadmat(os.path.join(path, file))['params_true']
-            X = loadmat(os.path.join(path, file))['amps_fit']
-            probs_fit = loadmat(os.path.join(path, file))['probs_fit'].flatten()
-
-            fig = plt.figure(1)
-            fig.clear()
-            ax = Axes3D(fig, auto_add_to_figure=False)
-            fig.add_axes(ax)
-            plt.xlabel(r'$I_1$ ($\mu$A)', fontsize=16)
-            plt.ylabel(r'$I_2$ ($\mu$A)', fontsize=16)
-            plt.xlim(-2, 2)
-            plt.ylim(-2, 2)
-            ax.set_zlim(-2, 2)
-            ax.set_zlabel(r'$I_3$ ($\mu$A)', fontsize=16)
-
-            scat = ax.scatter(X[:, 0], 
-                                X[:, 1],
-                                X[:, 2], marker='o', 
-                                c=probs_fit, s=20, alpha=0.8, vmin=0, vmax=1)
-            plt.show()
-
-            savedict['amps_raw'] = deepcopy(X)
-            savedict['probs_raw'] = deepcopy(probs_fit)
+            # Check if multi-site data is available
+            multisite_available = 'probs_multisite' in fit_data
+            if multisite_available:
+                probs_multisite = fit_data['probs_multisite'].flatten()
+                params_multisite = fit_data['params_multisite']
+                print(f"    Multi-site data found for cell {c}, pattern {p}")
+            else:
+                print(f"    No multi-site data for cell {c}, pattern {p}")
             
-            # Find indices of rows in A corresponding to rows in B, preserving order
+            # Find indices of rows in amps_gsort corresponding to rows in X, preserving order
             indices = [np.where(np.all(amps_gsort == row, axis=1))[0][0] for row in X]
             remaining_inds = np.setdiff1d(np.arange(len(amps_gsort)), indices)
             amps_remaining = deepcopy(amps_gsort[remaining_inds])
 
+            # Create full probability array for all trials
             probs_flipped = np.zeros(len(amps_gsort))
             probs_flipped[indices] = probs_fit
 
+            # Calculate probabilities for remaining trials using fitted parameters
             probs_remaining = fitting.sigmoidND_nonlinear(sm.add_constant(amps_remaining, has_constant='add'),
                                                         params)
-            probs_flipped[remaining_inds] = np.where(probs_remaining > 0.5, 1, 0)
+            probs_flipped[remaining_inds] = probs_remaining
             
-            num_trials = all_trials[p-1]
-            savedict['trials_all'] = deepcopy(num_trials)
-            savedict['trials_raw'] = deepcopy(num_trials[indices])
-
-            fig = plt.figure(2)
-            fig.clear()
-            ax = Axes3D(fig, auto_add_to_figure=False)
-            fig.add_axes(ax)
-            plt.xlabel(r'$I_1$ ($\mu$A)', fontsize=16)
-            plt.ylabel(r'$I_2$ ($\mu$A)', fontsize=16)
-            plt.xlim(-2, 2)
-            plt.ylim(-2, 2)
-            ax.set_zlim(-2, 2)
-            ax.set_zlabel(r'$I_3$ ($\mu$A)', fontsize=16)
-
-            scat = ax.scatter(amps_gsort[:, 0], 
-                                amps_gsort[:, 1],
-                                amps_gsort[:, 2], marker='o', 
-                                c=probs_flipped, s=20, alpha=0.8, vmin=0, vmax=1)
-            plt.show()
-
-            savedict['probs_flipped'] = deepcopy(probs_flipped)
-
-            Xdata_full = deepcopy(amps_gsort)
-            selec_probs_full = np.clip(probs_flipped, 1e-2, 1-1e-2)
-            y_full = np.log(selec_probs_full/(1-selec_probs_full))
-
-            # Assuming Xdata and y are in numpy format, convert them to torch tensors
-            amps_plot_torch = torch.tensor(amps_gsort, dtype=torch.float32)
-            X_train_full = torch.tensor(Xdata_full, dtype=torch.float32)
-            y_train_full = torch.tensor(y_full.reshape(-1), dtype=torch.float32)
-
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            amps_plot_torch = amps_plot_torch.to(device)
-            X_train_full = X_train_full.to(device)
-            y_train_full = y_train_full.to(device)
-
-            # Define the GP Model
-            class GPRegressionModel(gpytorch.models.ExactGP):
-                def __init__(self, train_x, train_y, likelihood):
-                    super(GPRegressionModel, self).__init__(train_x, train_y, likelihood)
-                    self.mean_constant = ConstantMean()
-                    # self.mean_linear = LinearMean(input_size=train_x.size(1))
-                    self.covar_module = RBFKernel()
-
-                def forward(self, x):
-                    # Add the constant and linear mean components manually
-                    mean_x = self.mean_constant(x)# + self.mean_linear(x)
-                    covar_x = self.covar_module(x)
-                    return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
-
-            # Early stopping class
-            class EarlyStopping:
-                def __init__(self, patience=10, min_delta=0.0):
-                    """
-                    :param patience: How many epochs to wait before stopping when loss isn't decreasing.
-                    :param min_delta: Minimum change in monitored loss to qualify as an improvement.
-                    """
-                    self.patience = patience
-                    self.min_delta = min_delta
-                    self.counter = 0
-                    self.best_loss = None
-                    self.stop = False
-
-                def step(self, val_loss):
-                    if self.best_loss is None:
-                        self.best_loss = val_loss
-                    elif val_loss > self.best_loss - self.min_delta:
-                        self.counter += 1
-                        if self.counter >= self.patience:
-                            self.stop = True
-                    else:
-                        self.best_loss = val_loss
-                        self.counter = 0
-
-            # Initialize the likelihood and model
-            likelihood_full = GaussianLikelihood()
-            model_full = GPRegressionModel(X_train_full, y_train_full, likelihood_full)
-
-            model_full = model_full.to(device)
-            likelihood_full = likelihood_full.to(device)
-
-            # Set model and likelihood in training mode
-            model_full.train()
-            likelihood_full.train()
-
-            # Use an optimizer
-            optimizer_full = torch.optim.AdamW([{'params': model_full.parameters()}], lr=1e-2)
-
-            # Set up marginal log likelihood for GPyTorch
-            mll_full = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood_full, model_full)
-
-            # Early stopping setup
-            early_stopping_full = EarlyStopping(patience=10, min_delta=1e-3)
-
-            # Training loop with early stopping
-            training_iter = 10000
-            losses_train_full = []
-            for j in range(training_iter):
-                model_full.train()
-                likelihood_full.train()
-                optimizer_full.zero_grad()
-                output_train_full = model_full(X_train_full)
-
-                loss_train_full = -mll_full(output_train_full, y_train_full)
-
-                losses_train_full.append(loss_train_full.item())
-                loss_train_full.backward()
-                optimizer_full.step()
-                early_stopping_full.step(loss_train_full.item())
-
-                if early_stopping_full.stop:
-                    print(f"Early stopping triggered at iteration {j + 1}")
-                    break
-
-                # if j % 10 == 0:
-                #     print(f"Iteration {j + 1}/{training_iter} - Training Loss: {loss_train_full.item()}")
-                #     print(f"  Lengthscale: {model_full.covar_module.lengthscale}")
-                #     print(f"  Noise: {model_full.likelihood.noise_covar.noise}")
-
-            # Model evaluation
-            model_full.eval()
-            likelihood_full.eval()
-            with torch.no_grad():
-                # Get model predictions
-                predictions_full = likelihood_full(model_full(amps_plot_torch))
-                mean_full = predictions_full.mean
-                var_full = predictions_full.variance
-                lower_full, upper_full = predictions_full.confidence_region()
-
-            probs_smooth = 1/(1 + np.exp(-mean_full.cpu().numpy().flatten()))
-        
-            fig = plt.figure(3)
-            fig.clear()
-            ax = Axes3D(fig, auto_add_to_figure=False)
-            fig.add_axes(ax)
-            plt.xlabel(r'$I_1$ ($\mu$A)', fontsize=16)
-            plt.ylabel(r'$I_2$ ($\mu$A)', fontsize=16)
-            plt.xlim(-2, 2)
-            plt.ylim(-2, 2)
-            ax.set_zlim(-2, 2)
-            ax.set_zlabel(r'$I_3$ ($\mu$A)', fontsize=16)
-
-            scat = ax.scatter(amps_gsort[:, 0], 
-                                amps_gsort[:, 1],
-                                amps_gsort[:, 2], marker='o', 
-                                c=probs_smooth, s=20, alpha=0.8, vmin=0, vmax=1)
-            plt.show()
-
-            savedict['probs_gp'] = deepcopy(probs_smooth)
-        
-            X = deepcopy(amps_gsort)
-            probs_fit = deepcopy(probs_flipped)
-            T = deepcopy(num_trials)
-
-            w_inits = []
-            for m in ms:
-                w_init = np.array(np.random.normal(size=(m, amps_gsort.shape[1]+1)))
-                z = 1 - (1 - zero_prob)**(1/len(w_init))
-                w_init[:, 0] = np.clip(w_init[:, 0], None, np.log(z/(1-z)))
-                w_init[:, 1:] = np.clip(w_init[:, 1:], -slope_bound, slope_bound)
-                w_inits.append(w_init)
-
-            opt, _ = fitting.fit_surface_earlystop(X, probs_fit, T, w_inits,
-                                        reg_method=reg_method, reg=[reg_param], slope_bound=slope_bound,
-                                        zero_prob=zero_prob, method=method,
-                                        R2_thresh=R2_thresh                           
-            )
-            params_multisite, _, _ = opt
-            probs_pred_multisite = fitting.sigmoidND_nonlinear(sm.add_constant(amps_gsort, has_constant='add'), 
-                                                                    params_multisite)
+            # Handle GPR predictions if available
+            if gpr_available:
+                # Create full GPR prediction array for all trials
+                gpr_flipped = np.zeros(len(amps_gsort))
+                gpr_flipped[indices] = gpr_predictions
+                
+                # For remaining trials, we could use the same sigmoid function or set to NaN
+                # For now, let's use the same approach as probabilities
+                gpr_remaining = fitting.sigmoidND_nonlinear(sm.add_constant(amps_remaining, has_constant='add'),
+                                                          params)
+                gpr_flipped[remaining_inds] = gpr_remaining
+                
+                # GPR data is available (no need to track in metadata)
+                pass
+            else:
+                # If no GPR data, create array of NaN values
+                gpr_flipped = np.full(len(amps_gsort), np.nan)
             
-            fig = plt.figure(3)
-            fig.clear()
-            ax = Axes3D(fig, auto_add_to_figure=False)
-            fig.add_axes(ax)
-            plt.xlabel(r'$I_1$ ($\mu$A)', fontsize=16)
-            plt.ylabel(r'$I_2$ ($\mu$A)', fontsize=16)
-            plt.xlim(-2, 2)
-            plt.ylim(-2, 2)
-            ax.set_zlim(-2, 2)
-            ax.set_zlabel(r'$I_3$ ($\mu$A)', fontsize=16)
+            # Handle multi-site predictions if available
+            if multisite_available:
+                # Create full multi-site prediction array for all trials
+                multisite_flipped = np.zeros(len(amps_gsort))
+                multisite_flipped[indices] = probs_multisite
+                
+                # For remaining trials, use multi-site parameters
+                multisite_remaining = fitting.sigmoidND_nonlinear(sm.add_constant(amps_remaining, has_constant='add'),
+                                                                params_multisite)
+                multisite_flipped[remaining_inds] = multisite_remaining
+                
+                # Multi-site data is available (no need to track in metadata)
+                pass
+            else:
+                # If no multi-site data, create array of NaN values
+                multisite_flipped = np.full(len(amps_gsort), np.nan)
 
-            scat = ax.scatter(amps_gsort[:, 0], 
-                                amps_gsort[:, 1],
-                                amps_gsort[:, 2], marker='o', 
-                                c=probs_pred_multisite, s=20, alpha=0.8, vmin=0, vmax=1)
-            plt.show()
+            # Get voltage trace from EI data (electrical image) - always get this
+            # print ei shape 
+            ei_data = vcd.get_ei_for_cell(c).ei
+            print(f"Cell {c}: ei_data shape {ei_data.shape}")
+            
+            # Initialize cell data if not exists
+            # Use actual cell ID for the key, but we'll renumber them 1-37 when saving
+            cell_key = f"cell_{c:03d}"
+            if cell_key not in cells_data:
+                # Remove dummy channels from EI data
+                dummy_ei_channels = [channel - 1 for channel in DUMMY_CHANNELS_519[1:]]
+                valid_indices = [i for i in range(ei_data.shape[0]) if i not in dummy_ei_channels]
+                ei_clean = ei_data[valid_indices]
+                
+                cells_data[cell_key] = {
+                    'stim_inputs': [],
+                    'stim_outputs': [],
+                    'gpr_outputs': [],  # Add GPR predictions
+                    'multisite_outputs': [],  # Add multi-site predictions
+                    'voltage_trace': ei_clean,  # Add voltage trace data
+                    'cell_id': c,
+                    'dataset': dataset,
+                    'datarun': datarun,
+                    'patterns': [],
+                    'cell_type': vcd.get_cell_type_for_cell(c) or 'unknown'
+                }
+            
+            # Convert each stimulation trial to dense vector
+            print(f"    Processing {len(amps_gsort)} trials for pattern {p}, cell {c}")
+            for trial_idx, amps_trial in enumerate(amps_gsort):
+                dense_vector = convert_to_dense_vector(stim_elecs, amps_trial)
+                cells_data[cell_key]['stim_inputs'].append(dense_vector)
+                
+                # Use actual response probability from fitted data
+                stim_output = probs_flipped[trial_idx]
+                cells_data[cell_key]['stim_outputs'].append(stim_output)
+                
+                # Add GPR prediction
+                gpr_output = gpr_flipped[trial_idx]
+                cells_data[cell_key]['gpr_outputs'].append(gpr_output)
+                
+                # Add multi-site prediction
+                multisite_output = multisite_flipped[trial_idx]
+                cells_data[cell_key]['multisite_outputs'].append(multisite_output)
+                
+                # Add pattern info
+                if p not in cells_data[cell_key]['patterns']:
+                    cells_data[cell_key]['patterns'].append(p)
 
-            savedict['probs_multisite'] = deepcopy(probs_pred_multisite)
-            savedict['params_multisite'] = deepcopy(params_multisite)
+# Convert lists to numpy arrays for each cell
+print("Converting data to numpy arrays...")
+for cell_key, cell_data in cells_data.items():
+    cell_data['stim_inputs'] = np.array(cell_data['stim_inputs'], dtype=np.float32)
+    cell_data['stim_outputs'] = np.array(cell_data['stim_outputs'], dtype=np.float32)
+    cell_data['gpr_outputs'] = np.array(cell_data['gpr_outputs'], dtype=np.float32)
+    cell_data['multisite_outputs'] = np.array(cell_data['multisite_outputs'], dtype=np.float32)
 
-            savemat(savepath, savedict)
-            torch.save(model_full.state_dict(), savepath.replace('.mat', '_gp_model.pth'))
+print(f"Created data for {len(cells_data)} cells")
 
+# Save to HDF5 file with structured format
+print(f"Saving to {output_file}")
+import json
 
-# In[ ]:
+with h5py.File(output_file, 'w') as f:
+    # Group cells by dataset (date)
+    dataset_cells = {}
+    dataset_wnoises = {}  # Store wnoise for each dataset
+    for cell_key, cell_data in cells_data.items():
+        dataset = cell_data['dataset']
+        if dataset not in dataset_cells:
+            dataset_cells[dataset] = []
+            # Get wnoise for this dataset from the datasets/dataruns/wnoises lists
+            dataset_idx = datasets.index(dataset)
+            dataset_wnoises[dataset] = wnoises[dataset_idx]
+        dataset_cells[dataset].append((cell_key, cell_data))
+    
+    # Sort datasets by date
+    sorted_datasets = sorted(dataset_cells.keys())
+    print(f"Datasets found: {sorted_datasets}")
+    
+    # Save each dataset's cells
+    global_cell_counter = 1  # Global counter across all datasets
+    
+    for dataset in sorted_datasets:
+        print(f"Processing dataset: {dataset}")
+        dataset_group = f.create_group(dataset)
+        
+        # Store wnoise at dataset level
+        dataset_group.create_dataset('wnoise', data=dataset_wnoises[dataset].encode('utf-8'))
+        
+        # Get cells for this dataset and sort them by cell_id
+        dataset_cell_list = dataset_cells[dataset]
+        dataset_cell_list.sort(key=lambda x: x[1]['cell_id'])  # Sort by actual cell_id
+        
+        for i, (cell_key, cell_data) in enumerate(dataset_cell_list):
+            if i % 10 == 0:  # Progress update every 10 cells
+                print(f"  Saving cell {global_cell_counter}/{sum(len(dataset_cells[d]) for d in sorted_datasets)}: {cell_key}")
+            
+            # Create enumerated cell key with global counter
+            enumerated_cell_key = f"cell_{global_cell_counter:03d}"
+            cell_group = dataset_group.create_group(enumerated_cell_key)
+            
+            # Increment global counter
+            global_cell_counter += 1
+            
+            # Save stim_inputs
+            cell_group.create_dataset('stim_inputs', data=cell_data['stim_inputs'], 
+                                     dtype=np.float32, compression='gzip')
+            
+            # Save stim_outputs
+            cell_group.create_dataset('stim_outputs', data=cell_data['stim_outputs'], 
+                                     dtype=np.float32, compression='gzip')
+            
+            # Save gpr_outputs
+            cell_group.create_dataset('gpr_outputs', data=cell_data['gpr_outputs'], 
+                                     dtype=np.float32, compression='gzip')
+            
+            # Save multisite_outputs
+            cell_group.create_dataset('multisite_outputs', data=cell_data['multisite_outputs'], 
+                                     dtype=np.float32, compression='gzip')
+            
+            # Save voltage_trace
+            cell_group.create_dataset('voltage_trace', data=cell_data['voltage_trace'], 
+                                     dtype=np.float32, compression='gzip')
+            
+            # Save metadata directly under cell group
+            cell_group.create_dataset('cell_id', data=cell_data['cell_id'])
+            cell_group.create_dataset('dataset', data=cell_data['dataset'].encode('utf-8'))
+            cell_group.create_dataset('datarun', data=cell_data['datarun'].encode('utf-8'))
+            cell_group.create_dataset('cell_type', data=cell_data['cell_type'].encode('utf-8'))
+            cell_group.create_dataset('patterns', data=cell_data['patterns'])
+    
+    # Create globals group
+    globals_group = f.create_group('globals')
+    
+    # Save electrode positions (removing dummy channels)
+    # Note: This assumes all datasets use the same electrode array
+    valid_indices = [i for i in range(coords.shape[0]) if i not in DUMMY_CHANNELS_519]
+    coords_clean = coords[valid_indices]
+    globals_group.create_dataset('electrode_positions', data=coords_clean, 
+                                dtype=np.float32, compression='gzip')
+    
+    # Save acquisition info
+    acquisition_info = {
+        'num_datasets': len(datasets),
+        'datasets': datasets,
+        'dataruns': dataruns,
+        'wnoises': wnoises,
+        'num_electrodes': NUM_ELECTRODES,
+        'num_electrodes_clean': NUM_ELECTRODES - len(DUMMY_CHANNELS_519),
+        'dummy_channels_removed': DUMMY_CHANNELS_519,
+        'creation_date': str(np.datetime64('now'))
+    }
+    globals_group.attrs['acquisition_info'] = json.dumps(acquisition_info)
+
+print("Done, dataset saved to HDF5 file.")
+print(f"Total cells: {len(cells_data)}")
+print(f"File size: {os.path.getsize(output_file) / (1024*1024):.2f} MB")
 
 
 

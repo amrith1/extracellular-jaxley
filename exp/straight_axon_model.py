@@ -10,8 +10,8 @@ import jaxley as jx
 import optax
 import jax.lax as lax
 from jax import jit, vmap, value_and_grad
-
 from lib import HH
+from loss_functions import sodium_peaks, diffusion_peaks, potassium_peaks, ei_widths
 
 SEED = 0
 
@@ -267,7 +267,9 @@ class StraightAxon:
             ) #shape: (n_electrodes, n_compartments)
 
         eap_mV = current_to_eap_matrix @ mem_current_uA
-        return eap_mV, mem_current_per_area, mem_voltage
+        
+        #time should be the first dimension
+        return eap_mV.transpose(), mem_current_per_area.transpose(), mem_voltage.transpose()
     
 
     def inverse_sigmoid(self, x: jnp.ndarray, lower: jnp.ndarray, upper: jnp.ndarray) -> jnp.ndarray:
@@ -287,7 +289,7 @@ class StraightAxon:
                 for param_name, param_value in params.items()}
 
     def loss_fn(self, predicted_ei, true_ei):
-        return jnp.sum(predicted_ei**2)
+        return jnp.sum(sodium_peaks(predicted_ei)) + jnp.sum(diffusion_peaks(predicted_ei)) + jnp.sum(potassium_peaks(predicted_ei)) + jnp.sum(ei_widths(predicted_ei, 40))
 
     def loss(self, opt_params):
         """
@@ -318,7 +320,6 @@ class StraightAxon:
             
         epoch_losses = []
         # Import time module for timing epochs
-        self.reset_cell_ei_stimulus()
         import time
         epoch_times = []
         for epoch in range(num_epochs):
@@ -330,8 +331,7 @@ class StraightAxon:
             
             # Check for NaN
             if jnp.isnan(loss_val):
-                print(f"NaN loss detected at epoch {epoch}")
-                break
+                raise ValueError(f"NaN loss detected at epoch {epoch}")
             
             # Update parameters
             updates, opt_state = optimizer.update(gradients, opt_state)
@@ -377,6 +377,6 @@ class StraightAxon:
 
         gt_ei, _, _ = self.jitted_predict_ei(ground_truth_model_params)
         
-        return ground_truth_model_params, gt_ei[0, :]
+        return ground_truth_model_params, gt_ei
 
         

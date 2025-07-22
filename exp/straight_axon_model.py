@@ -13,8 +13,8 @@ from jax import jit, vmap, value_and_grad
 
 from lib import HH
 
-
 SEED = 0
+
 NUM_EPOCHS = 400
 SIM_TIME_SAMPLES = 200
 TIME_STEP = 10e-3 #ms
@@ -53,7 +53,7 @@ SAVE_NAME = f'seed_{SEED}'
 np.random.seed(SEED)
 ELEC_SPACING = 30.0
 ELECTRODE_CONFIGURATION = 'triangle'
-EXTRACELLULAR_CONDUCTIVITY = 1000 #ohm-cm
+EXTRACELLULAR_RESISTIVITY = 1000 #ohm-cm
 MEM_CAPACITANCE = 1.0 #uF/cm^2
 ELEC_COORDS = None
 
@@ -66,48 +66,13 @@ if ELECTRODE_CONFIGURATION == 'triangle':
     ELEC_COORDS = jnp.array(ELEC_COORDS, dtype=jnp.float32)
     ELEC_COORDS = jax.device_put(ELEC_COORDS) # Move to default accelerator (GPU if available)
 
-def compute_membrane_current_density(cell, params: Dict[str, jnp.ndarray], stim_current: jnp.ndarray):
-    """Compute membrane currents using cell parameters."""
 
-    #checkpoint_levels = 1
-    #time_points = TOTAL_SIM_TIME // TIME_STEP + 2
-    #checkpoints = [int(np.ceil(time_points**(1/checkpoint_levels))) for _ in range(checkpoint_levels)]
-
-    cell.stimulate(stim_current)
-    
-    record_values = ["v", "i_HH"]
-    for record_value in record_values:
-        cell.record(record_value)
-
-    cell_params = [{param_name: params[param_name]} for param_name in cell_params_list]
-    outputs = jx.integrate(cell, delta_t=TIME_STEP, params=cell_params).reshape(
-        len(record_values), NUM_COMPARTMENTS, -1)
-    
-    #compute transmembrane current at each compartment, capactive current as time derivative of membrane voltage and HH current
-    membrane_voltage, hh_current = outputs[0, :, :], outputs[1, :, :]
-    capacitive_current = MEM_CAPACITANCE * jnp.diff(membrane_voltage, axis=1) / (TIME_STEP * 1e3) #convert to mA/cm^2
-    return capacitive_current + hh_current[:, 1:], membrane_voltage[:, 1:] #mA/cm^2, total current, membrane voltage (mV)
+#checkpoint_levels = 1
+#time_points = TOTAL_SIM_TIME // TIME_STEP + 2
+#checkpoints = [int(np.ceil(time_points**(1/checkpoint_levels))) for _ in range(checkpoint_levels)]
 
 
-def compute_eap(params: Dict[str, jnp.ndarray], cell, stim_current: jnp.ndarray):
-    """Compute extracellular action potentials."""
-    membrane_current, membrane_voltage = compute_membrane_current_density(cell, params, stim_current) #mA/cm^2 (num_compartments, num_timepoints)
 
-    compartment_surface_area = 2 * jnp.pi * params["radius"] * jnp.array(cell.nodes["length"]) #um^2
-    compartment_surface_area = jax.device_put(compartment_surface_area)
-    total_membrane_current = membrane_current * compartment_surface_area[:, None] * 1e-8 # convert to mA, still (num_compartments, num_timepoints)
-
-    compartment_locations = compute_compartment_locations_from_orientations(params)
-
-    #Calculate pairwise distances between electrodes and compartments
-    elec_expanded = ELEC_COORDS[:, None, :] # shape: (n_electrodes, 1, 3)
-    comp_expanded = compartment_locations[None, :, :] # shape: (1, n_compartments, 3)
-    squared_diff = (elec_expanded - comp_expanded) ** 2 # shape: (n_electrodes, n_compartments, 3)
-    elec_compartment_distances_cm = jnp.sqrt(jnp.sum(squared_diff, axis=2)) * 1e-4 # convert to cm # shape: (n_electrodes, n_compartments)
-
-    # Compute 1/(4*pi*r) for each electrode-compartment pair (line source approximation for extracellular potential)
-    current_to_eap_matrix = EXTRACELLULAR_CONDUCTIVITY / (4 * jnp.pi * elec_compartment_distances_cm)  # shape: (n_electrodes, n_compartments)
-    return current_to_eap_matrix @ total_membrane_current, membrane_current, membrane_voltage # shape: (n_electrodes, n_timepoints)
 
 def transform_point(x: jnp.ndarray, y: jnp.ndarray, z: jnp.ndarray, 
                     phi: jnp.ndarray, theta: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -149,17 +114,11 @@ def compute_compartment_locations_from_orientations(
     ], axis=1).reshape(-1, 3)
 
 
-
 def point_source_stim_potential_mV_per_uA(extra_resistivity_ohm_cm: jnp.ndarray, 
-                                       electrode_locations_um: jnp.ndarray, point_locations_um: jnp.ndarray) -> jnp.ndarray:
-    """
-    Compute point source potential using analytical solution.
-    """
-    assert extra_resistivity_ohm_cm.size == 1,\
-        "elec_radius_um and extra_resistivity_ohm_cm must be scalars"
-    
-    elec_point_distances_cm = jnp.linalg.norm(electrode_locations_um[:, None, :] - point_locations_um[None, :, :], axis=2) * 1e-4 # convert to cm
-    return extra_resistivity_ohm_cm / (4 * jnp.pi * elec_point_distances_cm) # shape: (n_electrodes, n_points)
+                                       source_locations_um: jnp.ndarray, record_locations_um: jnp.ndarray) -> jnp.ndarray:
+    assert extra_resistivity_ohm_cm.size == 1, "extra_resistivity_ohm_cm must be scalars"
+    record_source_distances_cm = jnp.linalg.norm(record_locations_um[:, None, :] - source_locations_um[None, :, :], axis=2) * 1e-4 # convert to cm
+    return 1e-3 * extra_resistivity_ohm_cm / (4 * jnp.pi * record_source_distances_cm) # shape: (n_electrodes, n_points)
 
 def extracellular_triphasic_150us_stim_multielec(cell, adjacency_matrix: jnp.ndarray, params: Dict[str, jnp.ndarray], electrode_locations_um: jnp.ndarray, \
     electrode_intensities_uA: jnp.ndarray, compartment_locations_um: jnp.ndarray, extra_resistivity_ohm_cm: jnp.ndarray, time_step: float, t_pre: float,t_max: float ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -225,27 +184,29 @@ def extracellular_triphasic_150us_stim_multielec(cell, adjacency_matrix: jnp.nda
     return v, m, h, n
     
 
-
-
 class StraightAxon:
     def __init__(self):
+        self.PARAM_BOUNDS = PARAMETER_BOUNDS
+
         self.params = {}
         for param_name in all_params_list:
             bounds = PARAMETER_BOUNDS[param_name]
             self.params[param_name] = jnp.array([(bounds[0] + bounds[1])/2])
 
-        self.cell, self.adjacency_matrix = self.build_cell()
-        self.reset_cell_baseline()
+        self.ei_cell, self.adjacency_matrix = self.build_cell()
+        ei_initial_stimulus_voltage = jnp.array(
+            [0]*VOLTAGE_CLAMP_SEGMENT + [-70.0]*(NUM_COMPARTMENTS - VOLTAGE_CLAMP_SEGMENT)
+            )
+        self.ei_cell.set("v", ei_initial_stimulus_voltage)
+        self.ei_stim_current = jnp.zeros((NUM_COMPARTMENTS, SIM_TIME_SAMPLES))
 
-        self.PARAM_BOUNDS = PARAMETER_BOUNDS
+        self.ei_cell.stimulate(self.ei_stim_current)
+        self.ei_cell_record_values = ["v", "i_HH"]
+        for record_value in self.ei_cell_record_values:
+            self.ei_cell.record(record_value)
+        
         self.jitted_grad = jit(value_and_grad(self.loss, argnums=0))
         self.jitted_predict_ei = jit(self.predict_ei)
-
-        self.ei_stim_current = jnp.zeros((NUM_COMPARTMENTS, SIM_TIME_SAMPLES))
-        #STIM_CURRENT_DURATION = 0.1 #ms
-        #STIM_COMPARTMENTS = 50
-        #self.ei_stim_current = self.ei_stim_current.at\
-        #    [0:STIM_COMPARTMENTS, 0:int(STIM_CURRENT_DURATION/TIME_STEP)].set(0.2)
 
     def build_cell(self):
         """Build a cell with the given parameters."""
@@ -263,6 +224,10 @@ class StraightAxon:
         cell.set("capacitance", MEM_CAPACITANCE)
         cell.set("length", SEGMENT_LENGTH)
         cell.set("capacitance", MEM_CAPACITANCE)
+        cell.set("HH_m", 0.0353)
+        cell.set("HH_h", 0.9054)
+        cell.set("HH_n", 0.0677)
+        cell.set("v", -70.0)
 
         for param_name in cell_params_list:
             cell.make_trainable(param_name)
@@ -275,16 +240,35 @@ class StraightAxon:
 
         return cell, adjacency_matrix
 
-    def reset_cell_baseline(self):
-        self.cell.set("v", -70.0)
-        self.cell.set("HH_m", 0.0353)
-        self.cell.set("HH_h", 0.9054)
-        self.cell.set("HH_n", 0.0677)
 
-    def reset_cell_ei_stimulus(self):
-        self.reset_cell_baseline()
-        ei_initial_stimulus_voltage = jnp.array([0]*VOLTAGE_CLAMP_SEGMENT + [-70.0]*(NUM_COMPARTMENTS - VOLTAGE_CLAMP_SEGMENT))
-        self.cell.set("v", ei_initial_stimulus_voltage)
+    def predict_ei(self, params):
+        """
+        Predict extracellular potentials using the current parameters.
+        """
+        cell_params = [{param_name: params[param_name]} for param_name in cell_params_list]
+
+        compartment_locations = compute_compartment_locations_from_orientations(params)
+
+        outputs = jx.integrate(self.ei_cell, delta_t=TIME_STEP, params=cell_params, voltage_solver='jaxley.stone').reshape(
+            len(self.ei_cell_record_values), NUM_COMPARTMENTS, -1)
+        
+        _v, _i_HH = outputs[0, :, :], outputs[1, :, :]
+        capacitive_current = MEM_CAPACITANCE * jnp.diff(_v, axis=1) / (TIME_STEP * 1e3) #convert to mA/cm^2
+        mem_current_per_area = _i_HH[:, 0:-1] + capacitive_current #mA/cm^2
+        mem_voltage = _v[:, 0:-1]
+        
+        compartment_surface_area = jax.device_put(2 * jnp.pi * params["radius"] * jnp.array(self.ei_cell.nodes["length"])) #um^2
+        mem_current_uA = 1e-5 * mem_current_per_area * compartment_surface_area[:, None]# still (num_compartments, num_timepoints)
+        compartment_locations = compute_compartment_locations_from_orientations(params)
+        current_to_eap_matrix = point_source_stim_potential_mV_per_uA(
+            extra_resistivity_ohm_cm=jnp.array([EXTRACELLULAR_RESISTIVITY]), 
+            source_locations_um=compartment_locations, 
+            record_locations_um=ELEC_COORDS
+            ) #shape: (n_electrodes, n_compartments)
+
+        eap_mV = current_to_eap_matrix @ mem_current_uA
+        return eap_mV, mem_current_per_area, mem_voltage
+    
 
     def inverse_sigmoid(self, x: jnp.ndarray, lower: jnp.ndarray, upper: jnp.ndarray) -> jnp.ndarray:
         normalized = (x - lower) / (upper - lower)
@@ -302,52 +286,16 @@ class StraightAxon:
         return {param_name: self.sigmoid(param_value, self.PARAM_BOUNDS[param_name][0], self.PARAM_BOUNDS[param_name][1])
                 for param_name, param_value in params.items()}
 
-    def predict_ei(self, params):
-        """
-        Predict extracellular potentials using the current parameters.
-        """
-        return compute_eap(params, self.cell, self.ei_stim_current)
-    
     def loss_fn(self, predicted_ei, true_ei):
         return jnp.sum(predicted_ei**2)
 
-    def loss(self, opt_params, true_ei):
+    def loss(self, opt_params):
         """
         Computes a loss that is robust to temporal shifts by using a
         differentiable soft-alignment mechanism.
         """
         transformed_params = self.sigmoid_transform_parameters(opt_params)
         predicted_ei, _, _ = self.predict_ei(transformed_params)
-
-        loss = self.loss_fn(predicted_ei, true_ei)
-
-        # true_len = true_ei.shape[0]
-        # pred_len = predicted_ei.shape[0]
-        # n_electrodes = true_ei.shape[1]
-        # max_offset = true_len - pred_len
-
-        # def compute_loss_at_offset(offset):
-        #     pred_window = lax.dynamic_slice(
-        #         predicted_ei,
-        #         start_indices=[offset, 0],
-        #         slice_sizes=[true_len, n_electrodes]
-        #     )
-
-        #     epsilon = 1e-6
-        #     pred_norm = (pred_window - jnp.mean(pred_window)) / (jnp.std(pred_window) + epsilon)
-        #     true_norm = (true_ei - jnp.mean(true_ei)) / (jnp.std(true_ei) + epsilon)
-
-        #     mse = jnp.mean((pred_norm - true_norm)**2)
-        #     return mse
-
-        # offsets = jnp.arange(max_offset + 1)
-        # all_mse_losses = vmap(compute_loss_at_offset)(offsets)
-
-        
-        # temperature = 1.0
-        # weights = jax.nn.softmax(-all_mse_losses * temperature)
-
-        # final_loss = jnp.sum(weights * all_mse_losses)
         final_loss = jnp.sum(predicted_ei**2)
 
         return final_loss
@@ -410,26 +358,25 @@ class StraightAxon:
         
         return final_params, epoch_losses
 
-def generate_random_gt_params_ei(seed=None):
-    PERCENTILE_SAMPLE_AND_CLIP = 0.85
-    if seed is not None:
-        np.random.seed(seed)
-    #generate a random model within the bounds to produce the physical ei
-    ground_truth_model_params = {}
-    for param in PARAMETER_BOUNDS.keys():
-        mean = (PARAMETER_BOUNDS[param][0] + PARAMETER_BOUNDS[param][1]) / 2.0
-        max_min_range = PARAMETER_BOUNDS[param][1] - PARAMETER_BOUNDS[param][0]
-        CLIP_COEFF = np.abs(PERCENTILE_SAMPLE_AND_CLIP - 0.5)
-        sampled_val = np.random.uniform(mean - CLIP_COEFF * max_min_range, mean + CLIP_COEFF * max_min_range)
-        ground_truth_model_params[param] = jnp.array([sampled_val])
+    def generate_random_gt_params_ei(self, seed=None):
+        PERCENTILE_SAMPLE_AND_CLIP = 0.85
+        if seed is not None:
+            np.random.seed(seed)
+        #generate a random model within the bounds to produce the physical ei
+        ground_truth_model_params = {}
+        for param in PARAMETER_BOUNDS.keys():
+            mean = (PARAMETER_BOUNDS[param][0] + PARAMETER_BOUNDS[param][1]) / 2.0
+            max_min_range = PARAMETER_BOUNDS[param][1] - PARAMETER_BOUNDS[param][0]
+            CLIP_COEFF = np.abs(PERCENTILE_SAMPLE_AND_CLIP - 0.5)
+            sampled_val = np.random.uniform(mean - CLIP_COEFF * max_min_range, mean + CLIP_COEFF * max_min_range)
+            ground_truth_model_params[param] = jnp.array([sampled_val])
 
-    ground_truth_model_params['total_length_um'] = jnp.array([TOTAL_LENGTH])
-    ground_truth_model_params['segment_length_um'] = jnp.array([SEGMENT_LENGTH])
-    ground_truth_model_params = {**PARAMETER_BOUNDS, **ground_truth_model_params}
+        ground_truth_model_params['total_length_um'] = jnp.array([TOTAL_LENGTH])
+        ground_truth_model_params['segment_length_um'] = jnp.array([SEGMENT_LENGTH])
+        ground_truth_model_params = {**PARAMETER_BOUNDS, **ground_truth_model_params}
 
-    cell_container = StraightAxon()
-    gt_ei = cell_container.predict_ei(ground_truth_model_params)
-    
-    return ground_truth_model_params, gt_ei
+        gt_ei, _, _ = self.jitted_predict_ei(ground_truth_model_params)
+        
+        return ground_truth_model_params, gt_ei[0, :]
 
         

@@ -1,9 +1,5 @@
 from typing import Dict, Tuple, List
 import jax
-
-jax.config.update('jax_platform_name', 'cpu')  # Force GPU usage
-jax.config.update('jax_enable_x64', True)
-
 import jax.numpy as jnp
 import numpy as np
 import jaxley as jx
@@ -11,13 +7,16 @@ import optax
 import jax.lax as lax
 from jax import jit, vmap, value_and_grad
 from lib import HH
-from loss_functions import sodium_peaks, diffusion_peaks, potassium_peaks, ei_widths
+from loss_functions import sodium_peaks, diffusion_peaks, potassium_peaks, ei_widths, pairwise_time_differences
+
+jax.config.update('jax_platform_name', 'cpu')  # Force GPU usage
+jax.config.update('jax_enable_x64', True)
 
 SEED = 0
 
 NUM_EPOCHS = 400
-SIM_TIME_SAMPLES = 200
-TIME_STEP = 10e-3 #ms
+SIM_TIME_SAMPLES = 1700
+TIME_STEP = 1e-3 #ms
 TOTAL_SIM_TIME = SIM_TIME_SAMPLES * TIME_STEP #ms
 
 cell_params_list = [
@@ -41,8 +40,8 @@ PARAMETER_BOUNDS = {
         'axial_resistivity': (50.0, 200.0)
         }
 
-TOTAL_LENGTH = 3000.0
-SEGMENT_LENGTH = 3.0
+TOTAL_LENGTH = 1000.0
+SEGMENT_LENGTH = 2.0
 assert TOTAL_LENGTH % SEGMENT_LENGTH == 0, "TOTAL_LENGTH must be divisible by SEGMENT_LENGTH"
 NUM_COMPARTMENTS = int(TOTAL_LENGTH/SEGMENT_LENGTH)
 
@@ -205,6 +204,7 @@ class StraightAxon:
         for record_value in self.ei_cell_record_values:
             self.ei_cell.record(record_value)
         
+        self.jitted_loss = jit(self.loss)
         self.jitted_grad = jit(value_and_grad(self.loss, argnums=0))
         self.jitted_predict_ei = jit(self.predict_ei)
 
@@ -288,8 +288,15 @@ class StraightAxon:
         return {param_name: self.sigmoid(param_value, self.PARAM_BOUNDS[param_name][0], self.PARAM_BOUNDS[param_name][1])
                 for param_name, param_value in params.items()}
 
-    def loss_fn(self, predicted_ei, true_ei):
-        return jnp.sum(sodium_peaks(predicted_ei)) + jnp.sum(diffusion_peaks(predicted_ei)) + jnp.sum(potassium_peaks(predicted_ei)) + jnp.sum(ei_widths(predicted_ei, 40))
+    #def loss_fn(self, predicted_ei):
+    #    return jnp.sum(sodium_peaks(predicted_ei)) + jnp.sum(diffusion_peaks(predicted_ei)) + jnp.sum(potassium_peaks(predicted_ei))\
+    #    + jnp.sum(ei_widths(predicted_ei, component_one='sodium', component_two='potassium')) \
+    #        + jnp.sum(pairwise_time_differences(predicted_ei, component='sodium'))
+
+    def loss_fn(self, predicted_ei):
+        upsampled_ei = jax.image.resize(predicted_ei, (predicted_ei.shape[0]*2, predicted_ei.shape[1]), method='lanczos3')
+        sodium_time_diffs, _ = pairwise_time_differences(upsampled_ei, component='sodium')
+        return sodium_time_diffs[1,2]
 
     def loss(self, opt_params):
         """
@@ -297,8 +304,8 @@ class StraightAxon:
         differentiable soft-alignment mechanism.
         """
         transformed_params = self.sigmoid_transform_parameters(opt_params)
-        predicted_ei, _, _ = self.predict_ei(transformed_params)
-        final_loss = jnp.sum(predicted_ei**2)
+        predicted_ei, _, _ = self.jitted_predict_ei(transformed_params)
+        final_loss = self.loss_fn(predicted_ei)
 
         return final_loss
 

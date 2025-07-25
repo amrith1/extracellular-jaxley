@@ -91,3 +91,29 @@ class HH(Channel):
         alpha = 0.09575 * _vtrap(-(v + 37), 10)
         beta = 1.915 * save_exp(-(v + 47) / 80)
         return alpha, beta
+
+   
+def get_baseline_triphasic_stimulus(t_pre: float, t_max: float, time_step: float) -> jnp.ndarray:
+    """
+    Get baseline triphasic stimulus.
+    """
+    num_pre_time_steps = t_pre / time_step
+    num_50us_time_steps = 50e-3 / time_step
+    num_total_time_steps = t_max / time_step
+
+    # Assert time steps are close to integers and round
+    assert jnp.abs(num_pre_time_steps - jnp.round(num_pre_time_steps)) < 1e-10, "t_pre must result in integer number of time steps"
+    assert jnp.abs(num_50us_time_steps - jnp.round(num_50us_time_steps)) < 1e-10, "50us must result in integer number of time steps"
+    assert jnp.abs(num_total_time_steps - jnp.round(num_total_time_steps)) < 1e-10, "t_max must result in integer number of time steps"
+    
+    num_pre_time_steps = int(jnp.round(num_pre_time_steps))
+    num_50us_time_steps = int(jnp.round(num_50us_time_steps))
+    num_total_time_steps = int(jnp.round(num_total_time_steps))
+
+    return jnp.array(
+        [0.0] * int(t_pre / time_step) + \
+            [2/3] * int(50e-3 / time_step) + \
+                [-1] * int(50e-3 / time_step) + \
+                    [1/3] * int(50e-3 / time_step) + \
+                        [0.0] * int((t_max - t_pre - 150e-3) / time_step)
+    )

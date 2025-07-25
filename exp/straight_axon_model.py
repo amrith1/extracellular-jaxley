@@ -20,7 +20,7 @@ TIME_STEP = 1e-3 #ms
 TOTAL_SIM_TIME = SIM_TIME_SAMPLES * TIME_STEP #ms
 
 cell_params_list = [
-    'radius', 'HH_gNa', 'HH_gK', 'axial_resistivity'
+    'radius', 'HH_gNa', 'HH_gK'
 ]
 orientation_params_list = [
     'axon_origin_dist', 'axon_theta', 
@@ -342,7 +342,7 @@ class StraightAxon:
 
         return final_loss
 
-    def train(self, data_point, num_epochs=20, learning_rate=1e-1, betas=(0.9, 0.999)):
+    def train(self, data_point, num_epochs=NUM_EPOCHS, learning_rate=1e-1, betas=(0.9, 0.999)):
         """
         Simplified training without Jaxley's ParamTransform.
         """

@@ -209,6 +209,13 @@ class StraightAxon:
         self.jitted_loss = jit(self.loss)
         self.jitted_grad = jit(value_and_grad(self.loss, argnums=0))
         self.jitted_predict_ei = jit(self.predict_ei)
+        self.true_diffusion_peaks = None
+        self.true_sodium_peaks = None
+        self.true_potassium_peaks = None
+        self.true_ei_widths_so_po = None
+        self.true_ei_widths_di_po = None
+        self.sodium_time_diffs_true = None
+        self.diffusion_time_diffs_true = None
 
     def build_cell(self):
         """Build a cell with the given parameters."""
@@ -290,16 +297,39 @@ class StraightAxon:
         return {param_name: self.sigmoid(param_value, self.PARAM_BOUNDS[param_name][0], self.PARAM_BOUNDS[param_name][1])
                 for param_name, param_value in params.items()}
 
-    #def loss_fn(self, predicted_ei):
-    #    return jnp.sum(sodium_peaks(predicted_ei)) + jnp.sum(diffusion_peaks(predicted_ei)) + jnp.sum(potassium_peaks(predicted_ei))\
-    #    + jnp.sum(ei_widths(predicted_ei, component_one='sodium', component_two='potassium')) \
-    #        + jnp.sum(pairwise_time_differences(predicted_ei, component='sodium'))
-
     def loss_fn(self, predicted_ei):
-        upsampled_ei = jax.image.resize(predicted_ei, (predicted_ei.shape[0]*2, predicted_ei.shape[1]), method='lanczos3')
-        sodium_time_diffs, _ = pairwise_time_differences(upsampled_ei, component='sodium')
-        return sodium_time_diffs[1,2]
 
+        predicted_diffiusion_peaks = diffusion_peaks(predicted_ei)
+        predicted_sodium_peaks = sodium_peaks(predicted_ei)
+        predicted_potassium_peaks = potassium_peaks(predicted_ei)
+
+        sodium_peak_loss = jnp.mean(jnp.square(predicted_sodium_peaks - self.true_sodium_peaks))
+        diffusion_peak_loss = jnp.mean(jnp.square(predicted_diffiusion_peaks - self.true_diffusion_peaks))
+        potassium_peak_loss = jnp.mean(jnp.square(predicted_potassium_peaks - self.true_potassium_peaks))
+
+        predicted_ei_widths_so_po = ei_widths(predicted_ei, component_one='sodium', component_two='potassium')
+        width_loss_so = jnp.mean(jnp.square(predicted_ei_widths_so_po - self.true_ei_widths_so_po))
+
+        predicted_ei_widths_di_po = ei_widths(predicted_ei, component_one='diffusion', component_two='potassium')
+        width_loss_di = jnp.mean(jnp.square(predicted_ei_widths_di_po - self.true_ei_widths_di_po))
+
+        upsampled_ei = jax.image.resize(predicted_ei, (predicted_ei.shape[0]*2, predicted_ei.shape[1]), method='lanczos3')
+
+        sodium_time_diffs, _ = pairwise_time_differences(upsampled_ei, component='sodium')
+        
+        sodium_velocity_loss = jnp.mean(jnp.square(sodium_time_diffs - self.sodium_time_diffs_true)) * 1e6 #loss in us^2
+
+        diffusion_time_diffs, _ = pairwise_time_differences(upsampled_ei, component='diffusion')
+        diffusion_velocity_loss = jnp.mean(jnp.square(diffusion_time_diffs - self.diffusion_time_diffs_true)) * 1e6
+
+        total_loss = 0.3 *(sodium_peak_loss + 
+                      diffusion_peak_loss + 
+                      potassium_peak_loss * 4.0 
+                      + ((width_loss_so + width_loss_di) * 500.0) 
+                      + sodium_velocity_loss * 50.0 
+                      + diffusion_velocity_loss * 50.0) 
+
+        return total_loss
     def loss(self, opt_params):
         """
         Computes a loss that is robust to temporal shifts by using a
@@ -307,16 +337,28 @@ class StraightAxon:
         """
         transformed_params = self.sigmoid_transform_parameters(opt_params)
         predicted_ei, _, _ = self.jitted_predict_ei(transformed_params)
+
         final_loss = self.loss_fn(predicted_ei)
 
         return final_loss
 
-    def train(self, data_point, num_epochs=NUM_EPOCHS, learning_rate=1e-1, betas=(0.9, 0.999)):
+    def train(self, data_point, num_epochs=20, learning_rate=1e-1, betas=(0.9, 0.999)):
         """
         Simplified training without Jaxley's ParamTransform.
         """
-        self.data_point = data_point
-        
+        # Generate ground truth parameters and EI
+        true_ei_params = data_point[0]
+        true_ei = data_point[1]
+        self.true_diffusion_peaks = diffusion_peaks(true_ei)
+        self.true_sodium_peaks = sodium_peaks(true_ei)
+        self.true_potassium_peaks = potassium_peaks(true_ei)     
+        self.true_ei_widths_so_po = ei_widths(true_ei, component_one='sodium', component_two='potassium')
+        self.true_ei_widths_di_po = ei_widths(true_ei, component_one='diffusion', component_two='potassium')
+        upsampled_true_ei = jax.image.resize(true_ei, (true_ei.shape[0]*2, true_ei.shape[1]), method='lanczos3')
+        self.sodium_time_diffs_true, _ = pairwise_time_differences(upsampled_true_ei, component='sodium')
+        self.diffusion_time_diffs_true, _ = pairwise_time_differences(upsampled_true_ei, component='diffusion')
+
+   
         # Combine all parameters into one dictionary
         current_params = dict(self.params)
     
@@ -357,8 +399,7 @@ class StraightAxon:
                 opt_params[param_name] = optax.apply_updates(
                     opt_params[param_name], updates
                 )
-            # updates, opt_state = optimizer.update(gradients, opt_state)
-            # opt_params = optax.apply_updates(opt_params, updates)
+            
             current_physical_params = self.sigmoid_transform_parameters(opt_params)
 
             #Adding updated parameters to the list
@@ -377,7 +418,7 @@ class StraightAxon:
             print(f"Average epoch time: {np.mean(epoch_times):.2f} seconds")
             
         
-        self.plot_parameters_over_time(parameters_over_time)    
+        self.plot_parameters_over_time(parameters_over_time, true_ei_params)    
         # Get final parameters
         final_params = self.sigmoid_transform_parameters(opt_params)
     
@@ -408,7 +449,7 @@ class StraightAxon:
         return ground_truth_model_params, gt_ei
 
         
-    def plot_parameters_over_time(self, parameters_over_time):
+    def plot_parameters_over_time(self, parameters_over_time, true_ei_params):
         """
         Plot the parameters over time.
         
@@ -420,11 +461,17 @@ class StraightAxon:
         
         if n_params == 1:
             axes = [axes]
+
         
         for i, (param_name, values) in enumerate(parameters_over_time.items()):
-            axes[i].plot(values)
+            axes[i].plot(values, label='Predicted')
+            if param_name in true_ei_params:
+                true_value = float(true_ei_params[param_name][0])
+                axes[i].axhline(y=true_value, color='red', linestyle='--', 
+                               alpha=0.7, label='True value')
             axes[i].set_title(param_name)
             axes[i].set_xlabel('Epoch')
+            axes[i].legend()
             axes[i].grid(True)
         
         plt.tight_layout()

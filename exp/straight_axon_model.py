@@ -27,6 +27,8 @@ orientation_params_list = [
     'axon_phi', 'axon_spin_angle',  
 ]
 
+
+
 all_params_list = cell_params_list + orientation_params_list
 
 PARAMETER_BOUNDS = {
@@ -309,23 +311,29 @@ class StraightAxon:
 
         return final_loss
 
-    def train(self, num_epochs=NUM_EPOCHS, learning_rate=0.01):
+    def train(self, data_point, num_epochs=NUM_EPOCHS, learning_rate=1e-1, betas=(0.9, 0.999)):
         """
         Simplified training without Jaxley's ParamTransform.
         """
-        self.data_point = None
+        self.data_point = data_point
         
         # Combine all parameters into one dictionary
         current_params = dict(self.params)
     
         # Transform to optimization space
         opt_params = self.inverse_sigmoid_transform_parameters(current_params)
+        print("Initial parameters in optimization space:", opt_params)
         
-        # Initialize optimizer
-        optimizer = optax.adam(learning_rate=learning_rate)
-        opt_state = optimizer.init(opt_params)
-            
+        optimizers = {}
+        opt_states = {}
+        for param_name in opt_params.keys():
+            optimizers[param_name] = optax.adam(learning_rate=learning_rate, b1=betas[0], b2=betas[1])
+            opt_states[param_name] = optimizers[param_name].init(opt_params[param_name])
+
         epoch_losses = []
+        parameters_over_time = {}
+        for param_name in opt_params.keys():
+            parameters_over_time[param_name] = []
         # Import time module for timing epochs
         import time
         epoch_times = []
@@ -333,17 +341,29 @@ class StraightAxon:
             print(f"Epoch {epoch} started")
             start_time = time.time()
             # Compute loss and gradients
-            loss_val, gradients = self.jitted_grad(opt_params, self.data_point)
-            print(gradients)
+            # loss_val, gradients = self.jitted_grad(opt_params, self.data_point)
+            loss_val, gradients = self.jitted_grad(opt_params)
             
             # Check for NaN
             if jnp.isnan(loss_val):
                 raise ValueError(f"NaN loss detected at epoch {epoch}")
             
             # Update parameters
-            updates, opt_state = optimizer.update(gradients, opt_state)
-            opt_params = optax.apply_updates(opt_params, updates)
-            
+            for param_name in opt_params.keys():
+                param_gradients = gradients[param_name]
+                updates, opt_states[param_name] = optimizers[param_name].update(
+                    param_gradients, opt_states[param_name]
+                )
+                opt_params[param_name] = optax.apply_updates(
+                    opt_params[param_name], updates
+                )
+            # updates, opt_state = optimizer.update(gradients, opt_state)
+            # opt_params = optax.apply_updates(opt_params, updates)
+            current_physical_params = self.sigmoid_transform_parameters(opt_params)
+
+            #Adding updated parameters to the list
+            for param_name in opt_params.keys():
+                parameters_over_time[param_name].append(float(current_physical_params[param_name][0]))
             if epoch % 10 == 0:
                 # Compute gradient norm for monitoring
                 grad_norm = jnp.sqrt(sum(jnp.sum(g**2) for g in jax.tree_util.tree_leaves(gradients)))
@@ -355,8 +375,9 @@ class StraightAxon:
             print(f"Epoch {epoch} took {end_time - start_time:.2f} seconds")
             epoch_times.append(end_time - start_time)
             print(f"Average epoch time: {np.mean(epoch_times):.2f} seconds")
-            print(epoch_times)
-            print('epoch 0 took', epoch_times[0], 'seconds')
+            
+        
+        self.plot_parameters_over_time(parameters_over_time)    
         # Get final parameters
         final_params = self.sigmoid_transform_parameters(opt_params)
     
@@ -387,3 +408,24 @@ class StraightAxon:
         return ground_truth_model_params, gt_ei
 
         
+    def plot_parameters_over_time(self, parameters_over_time):
+        """
+        Plot the parameters over time.
+        
+        :param parameters_over_time: Dictionary where keys are parameter names and values are lists of parameter values over epochs.
+        """
+        import matplotlib.pyplot as plt
+        n_params = len(parameters_over_time)
+        fig, axes = plt.subplots(n_params, 1, figsize=(8, 3 * n_params))
+        
+        if n_params == 1:
+            axes = [axes]
+        
+        for i, (param_name, values) in enumerate(parameters_over_time.items()):
+            axes[i].plot(values)
+            axes[i].set_title(param_name)
+            axes[i].set_xlabel('Epoch')
+            axes[i].grid(True)
+        
+        plt.tight_layout()
+        plt.show()

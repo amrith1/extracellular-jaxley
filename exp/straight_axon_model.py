@@ -50,7 +50,7 @@ VOLTAGE_CLAMP_VALUE = 0.0
 
 SAVE_NAME = f'seed_{SEED}'
 np.random.seed(SEED)
-ELEC_SPACING = 30.0
+ELEC_SPACING = 300.0
 ELECTRODE_CONFIGURATION = 'triangle'
 EXTRACELLULAR_RESISTIVITY = 1000 #ohm-cm
 MEM_CAPACITANCE = 1.0 #uF/cm^2
@@ -154,7 +154,7 @@ class StraightAxon:
         self.extra_resistivity_ohm_cm = jnp.array([EXTRACELLULAR_RESISTIVITY])
 
         self.triphasic_stimulus = get_baseline_triphasic_stimulus(
-            t_pre=50e-3, t_max=1000e-3, time_step=TIME_STEP)
+            t_pre=200e-3, t_max=2500e-3, time_step=TIME_STEP)
 
         self.jitted_loss = jit(self.loss)
         self.jitted_grad = jit(value_and_grad(self.loss, argnums=0))
@@ -287,10 +287,10 @@ class StraightAxon:
         intra_comp_currents = (comp_potential_diffs / inter_comp_axial_resistance) * self.adjacency_matrix
         currents_compartments = jnp.sum(intra_comp_currents, axis=1)
         current_time_series = self.triphasic_stimulus[None, :] * currents_compartments[:, None]
-        self.estim_cell.stimulate(current_time_series)
+        data_stimuli = self.estim_cell.data_stimulate(current_time_series)
         
         cell_params = [{param_name: params[param_name]} for param_name in cell_params_list]
-        outputs = jx.integrate(self.estim_cell, delta_t=TIME_STEP, params=cell_params).reshape(
+        outputs = jx.integrate(self.estim_cell, delta_t=TIME_STEP, params=cell_params, voltage_solver='jaxley.stone', data_stimuli=data_stimuli).reshape(
             len(self.estim_cell_record_values), NUM_COMPARTMENTS, -1)
         
         v, m, h, n = outputs[0, :, :], outputs[1, :, :], outputs[2, :, :], outputs[3, :, :]

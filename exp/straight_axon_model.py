@@ -20,7 +20,7 @@ TIME_STEP = 1e-3 #ms
 TOTAL_SIM_TIME = SIM_TIME_SAMPLES * TIME_STEP #ms
 
 cell_params_list = [
-    'radius', 'HH_gNa', 'HH_gK'
+'radius', 'HH_gNa', 'HH_gK', 'axial_resistivity'
 ]
 orientation_params_list = [
     'axon_origin_dist', 'axon_theta', 
@@ -193,7 +193,8 @@ class StraightAxon:
         cell.set("v", -70.0)
 
         for param_name in cell_params_list:
-            cell.make_trainable(param_name)
+            if param_name != 'axial_resistivity':
+                cell.make_trainable(param_name)
 
         adjacency_matrix = jnp.zeros((NUM_COMPARTMENTS, NUM_COMPARTMENTS)).astype(jnp.float32)
         # Set adjacent compartments to 1 in adjacency matrix
@@ -329,11 +330,12 @@ class StraightAxon:
         v, m, h, n = outputs[0, :, :], outputs[1, :, :], outputs[2, :, :], outputs[3, :, :]
         return v, m, h, n
 
-    def train(self, data_point, num_epochs=NUM_EPOCHS, learning_rate=1e-1, betas=(0.9, 0.999)):
+    def train(self, data_point, num_epochs=NUM_EPOCHS, learning_rate=1e-1, betas=(0.9, 0.999), trainable_params_list={'radius', 'HH_gNa', 'HH_gK', 'axon_origin_dist', 'axon_theta', 'axon_phi', 'axon_spin_angle'}):
         """
         Simplified training without Jaxley's ParamTransform.
         """
         # Generate ground truth parameters and EI
+        print(f"Parameters we are training: {trainable_params_list}")
         true_ei_params = data_point[0]
         true_ei = data_point[1]
         self.true_diffusion_peaks = diffusion_peaks(true_ei)
@@ -380,12 +382,13 @@ class StraightAxon:
             # Update parameters
             for param_name in opt_params.keys():
                 param_gradients = gradients[param_name]
-                updates, opt_states[param_name] = optimizers[param_name].update(
-                    param_gradients, opt_states[param_name]
-                )
-                opt_params[param_name] = optax.apply_updates(
-                    opt_params[param_name], updates
-                )
+                if param_name in trainable_params_list:
+                    updates, opt_states[param_name] = optimizers[param_name].update(
+                        param_gradients, opt_states[param_name]
+                    )
+                    opt_params[param_name] = optax.apply_updates(
+                        opt_params[param_name], updates
+                    )
             
             current_physical_params = self.sigmoid_transform_parameters(opt_params)
 

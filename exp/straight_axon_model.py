@@ -20,12 +20,14 @@ TIME_STEP = 1e-3 #ms
 TOTAL_SIM_TIME = SIM_TIME_SAMPLES * TIME_STEP #ms
 
 cell_params_list = [
-    'radius', 'HH_gNa', 'HH_gK', 'axial_resistivity'
+    'radius', 'HH_gNa', 'HH_gK'
 ]
 orientation_params_list = [
     'axon_origin_dist', 'axon_theta', 
     'axon_phi', 'axon_spin_angle',  
 ]
+
+
 
 all_params_list = cell_params_list + orientation_params_list
 
@@ -161,6 +163,13 @@ class StraightAxon:
         self.jitted_predict_ei = jit(self.predict_ei)
         self.jitted_xtra_estim = jit(self.extracellular_triphasic_150us_stim_multielec)
 
+        self.true_diffusion_peaks = None
+        self.true_sodium_peaks = None
+        self.true_potassium_peaks = None
+        self.true_ei_widths_so_po = None
+        self.true_ei_widths_di_po = None
+        self.sodium_time_diffs_true = None
+        self.diffusion_time_diffs_true = None
 
     def build_cell(self):
         """Build a cell with the given parameters."""
@@ -242,16 +251,39 @@ class StraightAxon:
         return {param_name: self.sigmoid(param_value, self.PARAM_BOUNDS[param_name][0], self.PARAM_BOUNDS[param_name][1])
                 for param_name, param_value in params.items()}
 
-    #def loss_fn(self, predicted_ei):
-    #    return jnp.sum(sodium_peaks(predicted_ei)) + jnp.sum(diffusion_peaks(predicted_ei)) + jnp.sum(potassium_peaks(predicted_ei))\
-    #    + jnp.sum(ei_widths(predicted_ei, component_one='sodium', component_two='potassium')) \
-    #        + jnp.sum(pairwise_time_differences(predicted_ei, component='sodium'))
-
     def loss_fn(self, predicted_ei):
-        #upsampled_ei = jax.image.resize(predicted_ei, (predicted_ei.shape[0]*2, predicted_ei.shape[1]), method='lanczos3')
-        sodium_time_diffs, _ = pairwise_time_differences(predicted_ei, component='sodium')
-        return sodium_time_diffs[1,2]
 
+        predicted_diffiusion_peaks = diffusion_peaks(predicted_ei)
+        predicted_sodium_peaks = sodium_peaks(predicted_ei)
+        predicted_potassium_peaks = potassium_peaks(predicted_ei)
+
+        sodium_peak_loss = jnp.mean(jnp.square(predicted_sodium_peaks - self.true_sodium_peaks))
+        diffusion_peak_loss = jnp.mean(jnp.square(predicted_diffiusion_peaks - self.true_diffusion_peaks))
+        potassium_peak_loss = jnp.mean(jnp.square(predicted_potassium_peaks - self.true_potassium_peaks))
+
+        predicted_ei_widths_so_po = ei_widths(predicted_ei, component_one='sodium', component_two='potassium')
+        width_loss_so = jnp.mean(jnp.square(predicted_ei_widths_so_po - self.true_ei_widths_so_po))
+
+        predicted_ei_widths_di_po = ei_widths(predicted_ei, component_one='diffusion', component_two='potassium')
+        width_loss_di = jnp.mean(jnp.square(predicted_ei_widths_di_po - self.true_ei_widths_di_po))
+
+        upsampled_ei = jax.image.resize(predicted_ei, (predicted_ei.shape[0]*2, predicted_ei.shape[1]), method='lanczos3')
+
+        sodium_time_diffs, _ = pairwise_time_differences(upsampled_ei, component='sodium')
+        
+        sodium_velocity_loss = jnp.mean(jnp.square(sodium_time_diffs - self.sodium_time_diffs_true)) * 1e6 #loss in us^2
+
+        diffusion_time_diffs, _ = pairwise_time_differences(upsampled_ei, component='diffusion')
+        diffusion_velocity_loss = jnp.mean(jnp.square(diffusion_time_diffs - self.diffusion_time_diffs_true)) * 1e6
+
+        total_loss = 0.3 *(sodium_peak_loss + 
+                      diffusion_peak_loss + 
+                      potassium_peak_loss * 4.0 
+                      + ((width_loss_so + width_loss_di) * 500.0) 
+                      + sodium_velocity_loss * 50.0 
+                      + diffusion_velocity_loss * 50.0) 
+
+        return total_loss
     def loss(self, opt_params):
         """
         Computes a loss that is robust to temporal shifts by using a
@@ -259,6 +291,7 @@ class StraightAxon:
         """
         transformed_params = self.sigmoid_transform_parameters(opt_params)
         predicted_ei, _, _ = self.jitted_predict_ei(transformed_params)
+
         final_loss = self.loss_fn(predicted_ei)
 
         return final_loss
@@ -296,23 +329,40 @@ class StraightAxon:
         v, m, h, n = outputs[0, :, :], outputs[1, :, :], outputs[2, :, :], outputs[3, :, :]
         return v, m, h, n
 
-    def train(self, num_epochs=NUM_EPOCHS, learning_rate=0.01):
+    def train(self, data_point, num_epochs=NUM_EPOCHS, learning_rate=1e-1, betas=(0.9, 0.999)):
         """
         Simplified training without Jaxley's ParamTransform.
         """
-        self.data_point = None
-        
+        # Generate ground truth parameters and EI
+        true_ei_params = data_point[0]
+        true_ei = data_point[1]
+        self.true_diffusion_peaks = diffusion_peaks(true_ei)
+        self.true_sodium_peaks = sodium_peaks(true_ei)
+        self.true_potassium_peaks = potassium_peaks(true_ei)     
+        self.true_ei_widths_so_po = ei_widths(true_ei, component_one='sodium', component_two='potassium')
+        self.true_ei_widths_di_po = ei_widths(true_ei, component_one='diffusion', component_two='potassium')
+        upsampled_true_ei = jax.image.resize(true_ei, (true_ei.shape[0]*2, true_ei.shape[1]), method='lanczos3')
+        self.sodium_time_diffs_true, _ = pairwise_time_differences(upsampled_true_ei, component='sodium')
+        self.diffusion_time_diffs_true, _ = pairwise_time_differences(upsampled_true_ei, component='diffusion')
+
+   
         # Combine all parameters into one dictionary
         current_params = dict(self.params)
     
         # Transform to optimization space
         opt_params = self.inverse_sigmoid_transform_parameters(current_params)
+        print("Initial parameters in optimization space:", opt_params)
         
-        # Initialize optimizer
-        optimizer = optax.adam(learning_rate=learning_rate)
-        opt_state = optimizer.init(opt_params)
-            
+        optimizers = {}
+        opt_states = {}
+        for param_name in opt_params.keys():
+            optimizers[param_name] = optax.adam(learning_rate=learning_rate, b1=betas[0], b2=betas[1])
+            opt_states[param_name] = optimizers[param_name].init(opt_params[param_name])
+
         epoch_losses = []
+        parameters_over_time = {}
+        for param_name in opt_params.keys():
+            parameters_over_time[param_name] = []
         # Import time module for timing epochs
         import time
         epoch_times = []
@@ -320,17 +370,28 @@ class StraightAxon:
             print(f"Epoch {epoch} started")
             start_time = time.time()
             # Compute loss and gradients
-            loss_val, gradients = self.jitted_grad(opt_params, self.data_point)
-            print(gradients)
+            # loss_val, gradients = self.jitted_grad(opt_params, self.data_point)
+            loss_val, gradients = self.jitted_grad(opt_params)
             
             # Check for NaN
             if jnp.isnan(loss_val):
                 raise ValueError(f"NaN loss detected at epoch {epoch}")
             
             # Update parameters
-            updates, opt_state = optimizer.update(gradients, opt_state)
-            opt_params = optax.apply_updates(opt_params, updates)
+            for param_name in opt_params.keys():
+                param_gradients = gradients[param_name]
+                updates, opt_states[param_name] = optimizers[param_name].update(
+                    param_gradients, opt_states[param_name]
+                )
+                opt_params[param_name] = optax.apply_updates(
+                    opt_params[param_name], updates
+                )
             
+            current_physical_params = self.sigmoid_transform_parameters(opt_params)
+
+            #Adding updated parameters to the list
+            for param_name in opt_params.keys():
+                parameters_over_time[param_name].append(float(current_physical_params[param_name][0]))
             if epoch % 10 == 0:
                 # Compute gradient norm for monitoring
                 grad_norm = jnp.sqrt(sum(jnp.sum(g**2) for g in jax.tree_util.tree_leaves(gradients)))
@@ -342,8 +403,9 @@ class StraightAxon:
             print(f"Epoch {epoch} took {end_time - start_time:.2f} seconds")
             epoch_times.append(end_time - start_time)
             print(f"Average epoch time: {np.mean(epoch_times):.2f} seconds")
-            print(epoch_times)
-            print('epoch 0 took', epoch_times[0], 'seconds')
+            
+        
+        self.plot_parameters_over_time(parameters_over_time, true_ei_params)    
         # Get final parameters
         final_params = self.sigmoid_transform_parameters(opt_params)
     
@@ -374,3 +436,30 @@ class StraightAxon:
         return ground_truth_model_params, gt_ei
 
         
+    def plot_parameters_over_time(self, parameters_over_time, true_ei_params):
+        """
+        Plot the parameters over time.
+        
+        :param parameters_over_time: Dictionary where keys are parameter names and values are lists of parameter values over epochs.
+        """
+        import matplotlib.pyplot as plt
+        n_params = len(parameters_over_time)
+        fig, axes = plt.subplots(n_params, 1, figsize=(8, 3 * n_params))
+        
+        if n_params == 1:
+            axes = [axes]
+
+        
+        for i, (param_name, values) in enumerate(parameters_over_time.items()):
+            axes[i].plot(values, label='Predicted')
+            if param_name in true_ei_params:
+                true_value = float(true_ei_params[param_name][0])
+                axes[i].axhline(y=true_value, color='red', linestyle='--', 
+                               alpha=0.7, label='True value')
+            axes[i].set_title(param_name)
+            axes[i].set_xlabel('Epoch')
+            axes[i].legend()
+            axes[i].grid(True)
+        
+        plt.tight_layout()
+        plt.show()
